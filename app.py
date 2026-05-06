@@ -20,8 +20,9 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(Config.LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(Config.LINE_CHANNEL_SECRET)
 
-# 2. 啟動伺服器前，初始化 Firebase 連線
+# 2. 啟動伺服器前，初始化 Firebase 連線以及sheets
 init_firebase()
+init_sheets()
 
 # 3. LINE Webhook 接收端點
 @app.route("/callback", methods=['POST'])
