@@ -8,6 +8,7 @@ from linebot.models import MessageEvent, TextMessage
 # 匯入環境變數設定與稍後會實作的模組
 from config import Config
 from services.firebase_db import init_firebase
+from services.sheets_service import init_sheets
 from handlers.message_router import handle_text_message
 
 # 設定基本的日誌紀錄，方便在 Render 上 debug

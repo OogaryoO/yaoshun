@@ -1,0 +1,21 @@
+.env
+.env.*
+*.pem
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+
+venv/
+.venv/
+env/
+.env/
+
+*.log
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
