@@ -7,7 +7,6 @@ from linebot.models import MessageEvent
 from config import Config
 from services.line_service import LineService
 from services.firebase_db import FirebaseDB
-from services.sheets_service import SheetsService
 from services.dev_mode import is_dev_mode, handle_dev_command, get_role_override
 
 logger = logging.getLogger(__name__)
@@ -26,22 +25,22 @@ def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
         if dev_reply is not None:
             LineService.reply_text(line_bot_api, event.reply_token, dev_reply)
             return
-    # ─────────────────────────────────────────────────────────────────
-    
-    # 嘗試撈取使用者的 LINE 暱稱，讓 Firebase 和 Google Sheets 裡的資料更具可讀性
+    # ───────────────────────────────────────────────────────────────
+
+    # 嘗試撈取使用者的 LINE 暱稱，讓 Firebase 裡的資料更具可讀性
     # (注意：若使用者未加 Bot 為好友，可能無法取得 profile)
     display_name = "Unknown"
     try:
         profile = line_bot_api.get_profile(user_id)
         display_name = profile.display_name
     except Exception as e:
-        logger.warning(f"Could not get profile for {user_id}: {e}")
+        logger.warning(f"Could not get profile: {e}")
 
     # 1. 查詢或建立使用者，取得角色權限
     #    DEV_MODE 下若有記憶體覆蓋值，優先使用，跳過 Firestore 查詢
     if is_dev_mode() and (override := get_role_override(user_id)):
         role = override
-        logger.info(f"[DEV] Using overridden role '{role}' for user {user_id}")
+        logger.info(f"[DEV] Using overridden role '{role}'.")
     else:
         try:
             role = FirebaseDB.get_or_create_user(user_id, display_name)
@@ -54,7 +53,7 @@ def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
     if role == 'boss':
         _handle_boss_message(event, line_bot_api, user_msg)
     elif role == 'driver':
-        _handle_driver_message(event, line_bot_api, user_msg)
+        _handle_driver_message(event, line_bot_api, user_msg, user_id)
     else:
         _handle_customer_message(event, line_bot_api, user_msg, user_id, display_name)
 
@@ -97,7 +96,7 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
             try:
                 orders = FirebaseDB.get_orders_by_customer_name(customer_name)
             except Exception as e:
-                logger.error(f"Failed to fetch orders for customer {customer_name}: {e}")
+                logger.error(f"Failed to fetch orders for customer: {e}")
                 reply_text = "查詢訂單時發生錯誤，請稍後再試。"
             else:
                 if not orders:
@@ -163,8 +162,47 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                         ])
                         total = o.get('totalAmount', 0)
                         order_id = o.get('orderId', 'N/A')
-                        lines.append(f"• {customer}｜{items_str}｜${total}\n  訂單編號：{order_id}")
+                        # 待確認的訂單以「🕓 待確認」標示，未付款則用一般 bullet
+                        if o.get('paymentStatus') == 'pending_confirmation':
+                            prefix = "🕓 待確認"
+                        else:
+                            prefix = "•"
+                        lines.append(f"{prefix} {customer}｜{items_str}｜${total}\n  訂單編號：{order_id}")
+                    lines.append("\n💡 客戶已回報但尚未確認的訂單：輸入「確認付款 訂單編號 付款方式」即可入帳。")
+                    lines.append("    付款方式：cash / transfer / check")
                     reply_text = "\n".join(lines)
+
+    # ── 確認付款 <訂單編號> <付款方式> ─────────────────────────────────
+    elif user_msg.startswith("確認付款"):
+        rest = user_msg[4:].strip()
+        parts = rest.split()
+        if len(parts) != 2:
+            reply_text = (
+                "格式不正確，請輸入：\n"
+                "確認付款 訂單編號 付款方式\n"
+                "付款方式：cash / transfer / check\n"
+                "例：確認付款 ORD-20260514-101530-a1b2 cash"
+            )
+        else:
+            order_id, method = parts
+            try:
+                FirebaseDB.confirm_payment(order_id, method)
+                reply_text = (
+                    f"✅ 已確認付款並入帳。\n"
+                    f"訂單編號：{order_id}\n"
+                    f"付款方式：{method}"
+                )
+            except ValueError as e:
+                msg = str(e)
+                if msg == "already_paid":
+                    reply_text = f"訂單「{order_id}」已是已付款狀態，無需再次確認。"
+                elif msg == "invalid_method":
+                    reply_text = "付款方式不合法，請輸入 cash / transfer / check。"
+                else:
+                    reply_text = f"找不到訂單「{order_id}」，請確認編號是否正確。"
+            except Exception as e:
+                logger.error(f"confirm_payment failed: {e}")
+                reply_text = "確認付款時發生錯誤，請稍後再試。"
 
     # ── 預設提示 ──────────────────────────────────────────────────────
     else:
@@ -172,16 +210,35 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
             "老闆您好！可用指令如下：\n"
             "• 輸入「查詢客戶 關鍵字」模糊搜尋客戶\n"
             "• 輸入「客戶訂單 姓名」查看客戶歷史訂單\n"
-            "• 輸入「未付款清單 本週／本月／近兩個月／近三個月」查看未付款訂單"
+            "• 輸入「未付款清單 本週／本月／近兩個月／近三個月」查看未付款訂單\n"
+            "• 輸入「確認付款 訂單編號 付款方式」確認客戶已付款（cash/transfer/check）"
         )
 
     LineService.reply_text(line_bot_api, event.reply_token, reply_text)
 
 
-def _handle_driver_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg: str):
+def _handle_driver_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg: str, user_id: str):
     """送貨司機端功能"""
-    # 未來這裡可以攔截特定的關鍵字，或是直接提示司機點擊圖文選單打開 LIFF 表單
-    reply_text = f"辛苦了！送貨回報請點擊下方選單...\n您剛才輸入的是：{user_msg}\n(待開發：司機回報 LIFF)"
+
+    # ── 送達 <訂單編號> ────────────────────────────────────────────────
+    # 最小可用串接：呼叫 mark_delivered，是唯一會寫入 deliveryDate 的入口。
+    if user_msg.startswith("送達"):
+        order_id = user_msg[2:].strip()
+        if not order_id:
+            reply_text = "請在「送達」後面加上訂單編號，例：\n送達 ORD-20260514-101530-a1b2"
+        else:
+            try:
+                FirebaseDB.mark_delivered(order_id, user_id)
+                reply_text = f"✅ 已標記訂單 {order_id} 為已送達。"
+            except Exception as e:
+                logger.error(f"mark_delivered failed: {e}")
+                reply_text = "標記送達時發生錯誤，請稍後再試。"
+    else:
+        reply_text = (
+            "辛苦了！可用指令：\n"
+            "• 輸入「送達 訂單編號」回報已送達\n"
+            "（完整的司機回報介面待開發）"
+        )
     LineService.reply_text(line_bot_api, event.reply_token, reply_text)
 
 
@@ -231,24 +288,25 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                     if not product:
                         reply_text = f"找不到商品「{product_name}」，請先輸入「查看商品」確認可訂購項目。"
                     else:
-                        unit_price = product.get('price', 0)
+                        unit_price = int(product.get('price', 0) or 0)
                         spec = product.get('spec', '')
                         spec_str = f"（{spec}）" if spec else ""
-                        order_id, sheets_data = FirebaseDB.create_order(
-                            user_id, display_name, product_name, quantity, unit_price
+                        order_id, _ = FirebaseDB.create_order(
+                            user_id, display_name, product_name, spec, quantity, unit_price
                         )
-                        SheetsService.append_order(sheets_data)
                         total = unit_price * quantity
                         reply_text = (
                             f"✅ 下單成功！\n"
                             f"訂單編號：{order_id}\n"
                             f"品項：{product_name}{spec_str} x {quantity}\n"
+                            f"單價：${unit_price}\n"
                             f"總金額：${total}\n"
-                            f"付款狀態：未付款\n\n"
+                            f"付款狀態：未付款\n"
+                            f"配送司機：尚未指派\n\n"
                             f"如有疑問請輸入「聯絡老闆 您的問題」"
                         )
                 except Exception as e:
-                    logger.error(f"Order creation failed for user {user_id}: {e}")
+                    logger.error(f"Order creation failed: {e}")
                     reply_text = "下單時發生錯誤，請稍後再試或聯絡老闆。"
 
     # ── 我的未付款 ─────────────────────────────────────────────────────
@@ -256,7 +314,7 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
         try:
             orders = FirebaseDB.get_customer_unpaid_orders(user_id)
         except Exception as e:
-            logger.error(f"Failed to fetch unpaid orders for {user_id}: {e}")
+            logger.error(f"Failed to fetch unpaid orders: {e}")
             LineService.reply_text(line_bot_api, event.reply_token, "查詢時發生錯誤，請稍後再試。")
             return
 
@@ -283,7 +341,7 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
     elif user_msg.startswith("回報付款"):
         order_id = user_msg[4:].strip()
         if not order_id:
-            reply_text = "請在「回報付款」後面加上訂單編號，例：\n回報付款 ORD-20260510-123456"
+            reply_text = "請在「回報付款」後面加上訂單編號，例：\n回報付款 ORD-20260510-123456-a1b2"
         elif not Config.BOSS_LINE_ID:
             logger.error("BOSS_LINE_ID is not configured.")
             reply_text = "目前無法傳送通知，請稍後再試。"
@@ -302,7 +360,8 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                     f"訂單編號：{order_id}\n"
                     f"品項：{items_str}\n"
                     f"金額：${total}\n\n"
-                    f"請確認收款後更新訂單狀態。"
+                    f"請確認收款後輸入：\n"
+                    f"確認付款 {order_id} cash／transfer／check"
                 )
                 LineService.push_text(line_bot_api, Config.BOSS_LINE_ID, push_msg)
                 reply_text = (
@@ -318,7 +377,7 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                 else:
                     reply_text = f"找不到訂單「{order_id}」，請確認編號是否正確。"
             except Exception as e:
-                logger.error(f"notify_payment failed for {order_id}: {e}")
+                logger.error(f"notify_payment failed: {e}")
                 reply_text = "回報付款時發生錯誤，請稍後再試。"
 
     # ── 聯絡老闆 <訊息內容> ────────────────────────────────────────────
