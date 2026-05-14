@@ -15,6 +15,11 @@ def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
     """
     處理 LINE 文字訊息的進入點。
     負責解析使用者身分，並將請求分流給對應的角色邏輯模組。
+
+    系統目前僅支援兩個角色：
+      - boss   ：老闆，負責訂單管理、確認付款、回報送達
+      - customer：客戶，負責下單、查詢、回報付款
+    （driver 角色已下線，送貨回報改由老闆於 LINE Bot 直接操作）
     """
     user_id = event.source.user_id
     user_msg = event.message.text.strip()
@@ -49,11 +54,9 @@ def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
             LineService.reply_text(line_bot_api, event.reply_token, "系統連線異常，請稍後再試。")
             return
 
-    # 2. 根據角色進行主路由分流
+    # 2. 根據角色進行主路由分流：boss 走老闆流程，其餘一律視為 customer
     if role == 'boss':
-        _handle_boss_message(event, line_bot_api, user_msg)
-    elif role == 'driver':
-        _handle_driver_message(event, line_bot_api, user_msg, user_id)
+        _handle_boss_message(event, line_bot_api, user_msg, user_id)
     else:
         _handle_customer_message(event, line_bot_api, user_msg, user_id, display_name)
 
@@ -62,8 +65,8 @@ def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
 # 角色專屬邏輯區塊 (Private Functions)
 # ==========================================
 
-def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg: str):
-    """老闆端功能"""
+def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg: str, user_id: str):
+    """老闆端功能（兼任送貨回報）"""
 
     # ── 查詢客戶 <關鍵字> ─────────────────────────────────────────────
     if user_msg.startswith("查詢客戶"):
@@ -110,9 +113,10 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                             for i in items_list
                         ])
                         status = "✅已付款" if o.get('paymentStatus') == 'paid' else "❌未付款"
+                        delivered = "🚚已送達" if o.get('deliveryDate') else "📦未送達"
                         total = o.get('totalAmount', 0)
                         order_id = o.get('orderId', 'N/A')
-                        lines.append(f"• [{order_id}]\n  {items_str}\n  總額：${total}　{status}")
+                        lines.append(f"• [{order_id}]\n  {items_str}\n  總額：${total}　{status}　{delivered}")
                     reply_text = "\n".join(lines)
 
     # ── 未付款清單 <時間範圍> ─────────────────────────────────────────
@@ -204,28 +208,16 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                 logger.error(f"confirm_payment failed: {e}")
                 reply_text = "確認付款時發生錯誤，請稍後再試。"
 
-    # ── 預設提示 ──────────────────────────────────────────────────────
-    else:
-        reply_text = (
-            "老闆您好！可用指令如下：\n"
-            "• 輸入「查詢客戶 關鍵字」模糊搜尋客戶\n"
-            "• 輸入「客戶訂單 姓名」查看客戶歷史訂單\n"
-            "• 輸入「未付款清單 本週／本月／近兩個月／近三個月」查看未付款訂單\n"
-            "• 輸入「確認付款 訂單編號 付款方式」確認客戶已付款（cash/transfer/check）"
-        )
-
-    LineService.reply_text(line_bot_api, event.reply_token, reply_text)
-
-
-def _handle_driver_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg: str, user_id: str):
-    """送貨司機端功能"""
-
     # ── 送達 <訂單編號> ────────────────────────────────────────────────
-    # 最小可用串接：呼叫 mark_delivered，是唯一會寫入 deliveryDate 的入口。
-    if user_msg.startswith("送達"):
+    # 由老闆直接於 LINE Bot 標記訂單為已送達。
+    # 這是唯一會寫入 deliveryDate 的入口。
+    elif user_msg.startswith("送達"):
         order_id = user_msg[2:].strip()
         if not order_id:
-            reply_text = "請在「送達」後面加上訂單編號，例：\n送達 ORD-20260514-101530-a1b2"
+            reply_text = (
+                "請在「送達」後面加上訂單編號，例：\n"
+                "送達 ORD-20260514-101530-a1b2"
+            )
         else:
             try:
                 FirebaseDB.mark_delivered(order_id, user_id)
@@ -233,12 +225,18 @@ def _handle_driver_message(event: MessageEvent, line_bot_api: LineBotApi, user_m
             except Exception as e:
                 logger.error(f"mark_delivered failed: {e}")
                 reply_text = "標記送達時發生錯誤，請稍後再試。"
+
+    # ── 預設提示 ──────────────────────────────────────────────────────
     else:
         reply_text = (
-            "辛苦了！可用指令：\n"
-            "• 輸入「送達 訂單編號」回報已送達\n"
-            "（完整的司機回報介面待開發）"
+            "老闆您好！可用指令如下：\n"
+            "• 輸入「查詢客戶 關鍵字」模糊搜尋客戶\n"
+            "• 輸入「客戶訂單 姓名」查看客戶歷史訂單\n"
+            "• 輸入「未付款清單 本週／本月／近兩個月／近三個月」查看未付款訂單\n"
+            "• 輸入「確認付款 訂單編號 付款方式」確認客戶已付款（cash/transfer/check）\n"
+            "• 輸入「送達 訂單編號」標記訂單為已送達"
         )
+
     LineService.reply_text(line_bot_api, event.reply_token, reply_text)
 
 
@@ -302,7 +300,7 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                             f"單價：${unit_price}\n"
                             f"總金額：${total}\n"
                             f"付款狀態：未付款\n"
-                            f"配送司機：尚未指派\n\n"
+                            f"配送狀態：尚未送達\n\n"
                             f"如有疑問請輸入「聯絡老闆 您的問題」"
                         )
                 except Exception as e:
