@@ -20,6 +20,9 @@ class Config:
     # 老闆的 LINE UID (初期測試與權限判斷用)
     BOSS_LINE_ID = os.environ.get('BOSS_LINE_ID')
 
+    # 本機開發模式：設為 "true" 時啟用角色切換指令，絕對不可在正式環境開啟
+    DEV_MODE = os.environ.get('DEV_MODE', 'false').lower() == 'true'
+
     @classmethod
     def validate(cls):
         """

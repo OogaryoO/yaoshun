@@ -62,8 +62,55 @@ class FirebaseDB:
             return role
 
     # ==========================
-    # 2. 客戶端功能 (Orders)
+    # 2. 客戶端功能 (Products / Orders)
     # ==========================
+    @staticmethod
+    def get_products() -> list:
+        """
+        查詢目前上架中的商品列表。
+        只回傳 isActive=True 的商品。
+        """
+        products_ref = db.collection('Products').where('isActive', '==', True)
+        results = []
+        for doc in products_ref.stream():
+            data = doc.to_dict()
+            data['productId'] = doc.id
+            results.append(data)
+        return results
+
+    @staticmethod
+    def create_order(user_id: str, display_name: str, product_name: str, quantity: int, unit_price: int) -> tuple:
+        """
+        建立新訂單，存入 Firestore Orders 集合。
+        回傳 (order_id, sheets_data) tuple，sheets_data 供 SheetsService 使用。
+        """
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        order_id = f"ORD-{now.strftime('%Y%m%d-%H%M%S')}"
+        total_amount = unit_price * quantity
+
+        db.collection('Orders').document(order_id).set({
+            'customerId': user_id,
+            'customerName': display_name,
+            'items': [{'productName': product_name, 'quantity': quantity}],
+            'totalAmount': total_amount,
+            'paymentStatus': 'unpaid',
+            'driverId': '尚未指派',
+            'orderDate': firestore.SERVER_TIMESTAMP,
+            'createdAt': firestore.SERVER_TIMESTAMP,
+        })
+        logger.info(f"Created order {order_id} for user {user_id}.")
+
+        sheets_data = {
+            'orderId': order_id,
+            'orderDate': now,
+            'customerName': display_name,
+            'items': [{'productName': product_name, 'quantity': quantity}],
+            'totalAmount': total_amount,
+            'paymentStatus': 'unpaid',
+            'driverId': '尚未指派',
+        }
+        return order_id, sheets_data
+
     @staticmethod
     def get_customer_orders(user_id: str, limit: int = 5) -> list:
         """
@@ -81,6 +128,21 @@ class FirebaseDB:
             data['orderId'] = doc.id  # 將自動產生的 Document ID 塞回資料中
             results.append(data)
             
+        return results
+
+    @staticmethod
+    def get_customer_unpaid_orders(user_id: str) -> list:
+        """
+        查詢該客戶所有未付款（unpaid）或待確認（pending_confirmation）的訂單。
+        僅用單一 where 過濾 customerId 避免複合索引需求，付款狀態在 Python 端篩選。
+        """
+        query = db.collection('Orders').where('customerId', '==', user_id)
+        results = []
+        for doc in query.stream():
+            data = doc.to_dict()
+            if data.get('paymentStatus') in ('unpaid', 'pending_confirmation'):
+                data['orderId'] = doc.id
+                results.append(data)
         return results
 
     # ==========================
@@ -107,20 +169,70 @@ class FirebaseDB:
             raise
 
     # ==========================
-    # 4. 老闆端功能 (Orders)
+    # 4. 老闆端功能 (Users / Orders)
     # ==========================
     @staticmethod
-    def get_unpaid_orders() -> list:
+    def search_customers_by_name(keyword: str) -> list:
         """
-        未付款推播名單：撈取所有欠款名單，供後續排程推播給老闆。
+        模糊搜尋客戶：撈取所有 role=customer 的使用者，
+        在 Python 端以 keyword 做不分大小寫的子字串比對。
         """
-        orders_ref = db.collection('Orders')
-        query = orders_ref.where('paymentStatus', '==', 'unpaid')
-        
+        keyword_lower = keyword.lower()
+        results = []
+        for doc in db.collection('Users').where('role', '==', 'customer').stream():
+            data = doc.to_dict()
+            name = data.get('displayName', '')
+            if keyword_lower in name.lower():
+                data['userId'] = doc.id
+                results.append(data)
+        return results
+
+    @staticmethod
+    def notify_payment(order_id: str, user_id: str) -> dict:
+        """
+        客戶回報已付款：驗證訂單屬於該客戶，更新狀態為 'pending_confirmation'。
+        回傳訂單資料 dict，供老闆確認使用。
+        """
+        order_ref = db.collection('Orders').document(order_id)
+        doc = order_ref.get()
+        if not doc.exists:
+            raise ValueError(f"Order {order_id} not found.")
+        data = doc.to_dict()
+        if data.get('customerId') != user_id:
+            raise PermissionError(f"Order {order_id} does not belong to user {user_id}.")
+        if data.get('paymentStatus') == 'paid':
+            raise ValueError("already_paid")
+        order_ref.update({'paymentStatus': 'pending_confirmation'})
+        logger.info(f"Order {order_id} marked as pending_confirmation by {user_id}.")
+        return data
+
+    @staticmethod
+    def get_orders_by_customer_name(customer_name: str, limit: int = 10) -> list:
+        """
+        查詢指定客戶名稱的歷史訂單，以下單時間反序排列。
+        """
+        query = db.collection('Orders') \
+                  .where('customerName', '==', customer_name) \
+                  .order_by('orderDate', direction=firestore.Query.DESCENDING) \
+                  .limit(limit)
         results = []
         for doc in query.stream():
             data = doc.to_dict()
             data['orderId'] = doc.id
             results.append(data)
-            
+        return results
+
+    @staticmethod
+    def get_unpaid_orders(since: datetime = None) -> list:
+        """
+        未付款推播名單：撈取欠款清單，可選填 since 以限制最早下單時間。
+        """
+        query = db.collection('Orders').where('paymentStatus', '==', 'unpaid')
+        if since is not None:
+            query = query.where('orderDate', '>=', since)
+        results = []
+        for doc in query.stream():
+            data = doc.to_dict()
+            data['orderId'] = doc.id
+            results.append(data)
         return results
