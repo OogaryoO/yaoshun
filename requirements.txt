@@ -7,9 +7,6 @@ line-bot-sdk~=3.5.0
 # Firebase Admin SDK (Firestore 權限與資料庫)
 firebase-admin~=6.4.0
 
-# Google Sheets API (帳務儀表板同步)
-gspread==6.0.0
-
 # Production WSGI Server (Render 部署必備)
 gunicorn==21.2.0
 
