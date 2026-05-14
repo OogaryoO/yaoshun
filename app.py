@@ -5,10 +5,9 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage
 
-# 匯入環境變數設定與稍後會實作的模組
+# 匯入環境變數設定與服務模組
 from config import Config
 from services.firebase_db import init_firebase
-from services.sheets_service import init_sheets
 from handlers.message_router import handle_text_message
 
 # 設定基本的日誌紀錄，方便在 Render 上 debug
@@ -21,27 +20,26 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(Config.LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(Config.LINE_CHANNEL_SECRET)
 
-# 2. 啟動伺服器前，初始化 Firebase 連線以及sheets
+# 2. 啟動伺服器前，初始化 Firebase 連線
 init_firebase()
-init_sheets()
 
 # 3. LINE Webhook 接收端點
 @app.route("/callback", methods=['POST'])
 def callback():
     # 取得 LINE 官方發送的 X-Line-Signature header
     signature = request.headers['X-Line-Signature']
-    
+
     # 取得 request body 作為純文字
     body = request.get_data(as_text=True)
     logger.debug(f"Received webhook body: {body}")
-    
+
     # 驗證 Webhook 的簽章並交由 handler 處理
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         logger.error("Invalid signature. Check your LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET.")
         abort(400)
-        
+
     return 'OK'
 
 # 4. 訊息事件綁定
