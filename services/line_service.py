@@ -1,6 +1,6 @@
 import logging
 from linebot import LineBotApi
-from linebot.models import TextSendMessage
+from linebot.models import FlexSendMessage, TextSendMessage
 from linebot.exceptions import LineBotApiError
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,18 @@ class LineService:
     # 預留區域：未來開發 LIFF 與 Flex Message 的擴充點
     # ==========================================
     
+    @staticmethod
+    def reply_flex(line_bot_api: LineBotApi, reply_token: str, alt_text: str, contents):
+        """回覆 Flex Message（互動式卡片）給使用者。"""
+        try:
+            message = FlexSendMessage(alt_text=alt_text, contents=contents)
+            line_bot_api.reply_message(reply_token, message)
+            logger.info("Successfully replied flex message.")
+        except LineBotApiError as e:
+            logger.error(f"LINE API Error (reply flex): {e.status_code} {e.error.message}")
+        except Exception as e:
+            logger.error(f"Unexpected error in reply_flex: {e}", exc_info=True)
+
     @staticmethod
     def reply_liff_menu(line_bot_api: LineBotApi, reply_token: str, role: str):
         """

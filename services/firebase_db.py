@@ -91,6 +91,9 @@ class FirebaseDB:
             data = doc.to_dict()
             data['productId'] = doc.id
             results.append(data)
+        # Sort by name then spec so same-name products are grouped and the
+        # numbered list order is stable across calls (customers order by index).
+        results.sort(key=lambda p: (p.get('productName', ''), p.get('spec', '')))
         return results
 
     @staticmethod

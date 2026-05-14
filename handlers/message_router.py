@@ -1,7 +1,15 @@
 import logging
 from datetime import datetime, timedelta, timezone
 from linebot import LineBotApi
-from linebot.models import MessageEvent
+from linebot.models import (
+    MessageEvent,
+    BubbleContainer,
+    BoxComponent,
+    TextComponent,
+    ButtonComponent,
+    SeparatorComponent,
+    MessageAction,
+)
 
 # 匯入我們剛剛建立好的所有 Service 模組
 from config import Config
@@ -243,7 +251,7 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
 def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg: str, user_id: str, display_name: str):
     """客戶端功能"""
 
-    # ── 查看商品 ───────────────────────────────────────────────────────
+    # ── 查看商品：Step 1 — 商品類別選擇 ──────────────────────────────────
     if user_msg == "查看商品":
         try:
             products = FirebaseDB.get_products()
@@ -253,50 +261,101 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
             return
 
         if not products:
-            reply_text = "目前暫無上架商品，請稍後再查詢。"
-        else:
-            lines = ["📦 目前可訂購的商品如下：\n"]
-            for p in products:
-                name = p.get('productName', '未知商品')
-                price = p.get('price', 0)
-                spec = p.get('spec', '')
-                spec_str = f"（{spec}）" if spec else ""
-                lines.append(f"• {name}{spec_str}｜${price}")
-            lines.append("\n📝 下單方式：輸入「下單 商品名稱 數量」")
-            lines.append("例：下單 電線桿 2")
-            reply_text = "\n".join(lines)
+            LineService.reply_text(line_bot_api, event.reply_token, "目前暫無上架商品，請稍後再查詢。")
+            return
 
-    # ── 下單 <商品名稱> <數量> ─────────────────────────────────────────
+        LineService.reply_flex(line_bot_api, event.reply_token,
+                               "商品目錄", _flex_category_picker(products))
+        return
+
+    # ── 商品類別 <品名>：Step 2 — 規格選擇（或直接顯示商品詳情）───────────────
+    elif user_msg.startswith("商品類別"):
+        category_name = user_msg[4:].strip()
+        try:
+            products = FirebaseDB.get_products()
+        except Exception as e:
+            logger.error(f"Failed to fetch products: {e}")
+            LineService.reply_text(line_bot_api, event.reply_token, "查詢商品時發生錯誤，請稍後再試。")
+            return
+
+        variants = [
+            (idx, p) for idx, p in enumerate(products, start=1)
+            if p.get('productName') == category_name
+        ]
+        if not variants:
+            LineService.reply_text(line_bot_api, event.reply_token,
+                                   f"找不到商品「{category_name}」，請輸入「查看商品」重新選擇。")
+            return
+
+        if len(variants) == 1:
+            # Only one spec — skip spec picker and go straight to product detail
+            global_idx, product = variants[0]
+            LineService.reply_flex(line_bot_api, event.reply_token,
+                                   f"商品資訊 #{global_idx}", _flex_product_detail(global_idx, product))
+        else:
+            LineService.reply_flex(line_bot_api, event.reply_token,
+                                   f"{category_name} 規格選擇", _flex_spec_picker(category_name, variants))
+        return
+
+    # ── 商品確認 <編號>：Step 3 — 商品詳情卡片 ──────────────────────────
+    elif user_msg.startswith("商品確認"):
+        try:
+            idx = int(user_msg[4:].strip())
+        except ValueError:
+            LineService.reply_text(line_bot_api, event.reply_token, "無效的商品編號，請重新選擇。")
+            return
+
+        try:
+            products = FirebaseDB.get_products()
+        except Exception as e:
+            logger.error(f"Failed to fetch products: {e}")
+            LineService.reply_text(line_bot_api, event.reply_token, "查詢商品時發生錯誤，請稍後再試。")
+            return
+
+        if idx < 1 or idx > len(products):
+            LineService.reply_text(line_bot_api, event.reply_token,
+                                   f"商品編號 {idx} 不存在，請輸入「查看商品」重新選擇。")
+            return
+
+        LineService.reply_flex(line_bot_api, event.reply_token,
+                               f"商品資訊 #{idx}", _flex_product_detail(idx, products[idx - 1]))
+        return
+
+    # ── 下單 <編號> <數量> ────────────────────────────────────────────
     elif user_msg.startswith("下單"):
         parts = user_msg.split()
         if len(parts) != 3:
-            reply_text = "下單格式不正確，請輸入：\n下單 商品名稱 數量\n例：下單 水蜜桃 2"
+            reply_text = "下單格式不正確，請輸入：\n下單 編號 數量\n先輸入「查看商品」取得編號\n例：下單 3 2"
         else:
-            product_name = parts[1]
             try:
+                idx = int(parts[1])
                 quantity = int(parts[2])
                 if quantity <= 0:
                     raise ValueError
             except ValueError:
-                reply_text = "數量請輸入正整數，例：下單 水蜜桃 2"
+                reply_text = "編號與數量請輸入正整數\n例：下單 3 2"
             else:
                 try:
                     products = FirebaseDB.get_products()
-                    product = next((p for p in products if p.get('productName') == product_name), None)
-                    if not product:
-                        reply_text = f"找不到商品「{product_name}」，請先輸入「查看商品」確認可訂購項目。"
+                    if idx < 1 or idx > len(products):
+                        reply_text = (
+                            f"編號 {idx} 不存在，請輸入「查看商品」確認正確編號"
+                            f"（1 ～ {len(products)}）。"
+                        )
                     else:
-                        unit_price = int(product.get('price', 0) or 0)
+                        product = products[idx - 1]
+                        product_name = product.get('productName', '')
                         spec = product.get('spec', '')
-                        spec_str = f"（{spec}）" if spec else ""
+                        unit_price = int(product.get('price', 0) or 0)
                         order_id, _ = FirebaseDB.create_order(
                             user_id, display_name, product_name, spec, quantity, unit_price
                         )
                         total = unit_price * quantity
+                        spec_line = f"\n尺寸：{spec}" if spec else ""
                         reply_text = (
                             f"✅ 下單成功！\n"
                             f"訂單編號：{order_id}\n"
-                            f"品項：{product_name}{spec_str} x {quantity}\n"
+                            f"品項：{product_name} x {quantity}{spec_line}\n"
                             f"單價：${unit_price}\n"
                             f"總金額：${total}\n"
                             f"付款狀態：未付款\n"
@@ -319,64 +378,89 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
         if not orders:
             reply_text = "您目前沒有任何未付款的訂單！"
         else:
+            # 以下單時間由舊到新排列，讓序號穩定
+            orders.sort(key=lambda o: (o.get('orderDate') is None, o.get('orderDate')))
             total_debt = sum(o.get('totalAmount', 0) for o in orders)
             lines = [f"📋 您目前共有 {len(orders)} 筆未付款訂單（合計 ${total_debt}）：\n"]
-            for o in orders:
+            tw_tz = timezone(timedelta(hours=8))
+            for idx, o in enumerate(orders, start=1):
                 items_list = o.get('items', [])
                 items_str = "、".join([
                     f"{i.get('productName', '')} x{i.get('quantity', 0)}"
                     for i in items_list
                 ])
                 total = o.get('totalAmount', 0)
-                order_id = o.get('orderId', 'N/A')
                 status = o.get('paymentStatus', '')
                 status_str = "（已回報，待確認）" if status == 'pending_confirmation' else ""
-                lines.append(f"• {order_id}\n  {items_str}｜${total}{status_str}")
-            lines.append("\n💡 輸入「回報付款 訂單編號」可通知老闆您已付款")
+                order_date = o.get('orderDate')
+                if order_date is not None:
+                    try:
+                        date_str = order_date.astimezone(tw_tz).strftime('%Y/%m/%d %H:%M')
+                    except Exception:
+                        date_str = str(order_date)
+                else:
+                    date_str = "—"
+                lines.append(f"#{idx}  {date_str}\n  {items_str}｜${total}{status_str}")
+            lines.append("\n💡 輸入「回報付款 序號」可通知老闆您已付款（例：回報付款 1）")
             reply_text = "\n".join(lines)
 
-    # ── 回報付款 <訂單編號> ──────────────────────────────────────────────
+    # ── 回報付款 <序號> ──────────────────────────────────────────────
     elif user_msg.startswith("回報付款"):
-        order_id = user_msg[4:].strip()
-        if not order_id:
-            reply_text = "請在「回報付款」後面加上訂單編號，例：\n回報付款 ORD-20260510-123456-a1b2"
-        elif not Config.BOSS_LINE_ID:
-            logger.error("BOSS_LINE_ID is not configured.")
-            reply_text = "目前無法傳送通知，請稍後再試。"
+        serial_str = user_msg[4:].strip()
+        if not serial_str:
+            reply_text = "請在「回報付款」後面加上序號，例：\n回報付款 1"
         else:
             try:
-                order = FirebaseDB.notify_payment(order_id, user_id)
-                items_list = order.get('items', [])
-                items_str = "、".join([
-                    f"{i.get('productName', '')} x{i.get('quantity', 0)}"
-                    for i in items_list
-                ])
-                total = order.get('totalAmount', 0)
-                push_msg = (
-                    f"💳 客戶回報付款\n"
-                    f"客戶：{display_name}\n"
-                    f"訂單編號：{order_id}\n"
-                    f"品項：{items_str}\n"
-                    f"金額：${total}\n\n"
-                    f"請確認收款後輸入：\n"
-                    f"確認付款 {order_id} cash／transfer／check"
-                )
-                LineService.push_text(line_bot_api, Config.BOSS_LINE_ID, push_msg)
-                reply_text = (
-                    f"✅ 已通知老闆您的付款回報！\n"
-                    f"訂單編號：{order_id}\n"
-                    f"老闆確認後即會更新狀態。"
-                )
-            except PermissionError:
-                reply_text = f"找不到屬於您的訂單「{order_id}」，請確認編號是否正確。"
-            except ValueError as e:
-                if str(e) == "already_paid":
-                    reply_text = f"訂單「{order_id}」已標註為已付款，無需重複回報。"
-                else:
-                    reply_text = f"找不到訂單「{order_id}」，請確認編號是否正確。"
-            except Exception as e:
-                logger.error(f"notify_payment failed: {e}")
-                reply_text = "回報付款時發生錯誤，請稍後再試。"
+                serial = int(serial_str)
+            except ValueError:
+                serial = None
+            if serial is None or serial < 1:
+                reply_text = "序號請輸入正整數，例：\n回報付款 1"
+            elif not Config.BOSS_LINE_ID:
+                logger.error("BOSS_LINE_ID is not configured.")
+                reply_text = "目前無法傳送通知，請稍後再試。"
+            else:
+                try:
+                    unpaid_orders = FirebaseDB.get_customer_unpaid_orders(user_id)
+                    unpaid_orders.sort(key=lambda o: (o.get('orderDate') is None, o.get('orderDate')))
+                    if serial > len(unpaid_orders):
+                        reply_text = f"序號 {serial} 不存在，您目前有 {len(unpaid_orders)} 筆未付款訂單。"
+                    else:
+                        o = unpaid_orders[serial - 1]
+                        order_id = o.get('orderId')
+                        order = FirebaseDB.notify_payment(order_id, user_id)
+                        items_list = order.get('items', [])
+                        items_str = "、".join([
+                            f"{i.get('productName', '')} x{i.get('quantity', 0)}"
+                            for i in items_list
+                        ])
+                        total = order.get('totalAmount', 0)
+                        push_msg = (
+                            f"💳 客戶回報付款\n"
+                            f"客戶：{display_name}\n"
+                            f"訂單編號：{order_id}\n"
+                            f"品項：{items_str}\n"
+                            f"金額：${total}\n\n"
+                            f"請確認收款後輸入：\n"
+                            f"確認付款 {order_id} cash／transfer／check"
+                        )
+                        LineService.push_text(line_bot_api, Config.BOSS_LINE_ID, push_msg)
+                        reply_text = (
+                            f"✅ 已通知老闆您的付款回報！\n"
+                            f"品項：{items_str}\n"
+                            f"金額：${total}\n"
+                            f"老闆確認後即會更新狀態。"
+                        )
+                except PermissionError:
+                    reply_text = "找不到屬於您的訂單，請確認序號是否正確。"
+                except ValueError as e:
+                    if str(e) == "already_paid":
+                        reply_text = f"第 {serial} 筆訂單已標註為已付款，無需重複回報。"
+                    else:
+                        reply_text = "找不到對應訂單，請確認序號是否正確。"
+                except Exception as e:
+                    logger.error(f"notify_payment failed: {e}")
+                    reply_text = "回報付款時發生錯誤，請稍後再試。"
 
     # ── 聯絡老闆 <訊息內容> ────────────────────────────────────────────
     elif user_msg.startswith("聯絡老闆"):
@@ -400,10 +484,185 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
         reply_text = (
             "歡迎光臨！您可以：\n"
             "• 輸入「查看商品」瀏覽目前商品\n"
-            "• 輸入「下單 商品名稱 數量」直接下單\n"
+            "• 輸入「下單 編號 數量」下單（編號請先查看商品取得）\n"
             "• 輸入「我的未付款」查看您尚未付款的訂單\n"
-            "• 輸入「回報付款 訂單編號」通知老闆您已付款\n"
+            "• 輸入「回報付款 序號」通知老闆您已付款（序號請先查看「我的未付款」）\n"
             "• 輸入「聯絡老闆 訊息內容」與老闆溝通"
         )
 
     LineService.reply_text(line_bot_api, event.reply_token, reply_text)
+
+
+# ==========================================
+# Flex Message Builders — Product Catalogue
+# ==========================================
+
+def _flex_category_picker(products: list):
+    """
+    Step 1: Shows all unique product names as tappable buttons.
+    Tapping sends "商品類別 <productName>" back to the bot.
+    """
+    seen = []
+    for p in products:
+        name = p.get('productName', '')
+        if name and name not in seen:
+            seen.append(name)
+
+    buttons = [
+        ButtonComponent(
+            action=MessageAction(label=name, text=f'商品類別 {name}'),
+            style='secondary',
+            height='sm',
+            margin='xs',
+        )
+        for name in seen
+    ]
+
+    return BubbleContainer(
+        size='giga',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text='堯順企業社', color='#CCFFCC', size='xs'),
+                TextComponent(text='商品目錄', color='#FFFFFF', weight='bold', size='xl'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            spacing='xs',
+            padding_all='md',
+            contents=buttons,
+        ),
+    )
+
+
+def _flex_spec_picker(category_name: str, variants: list):
+    """
+    Step 2: Shows all spec variants of a product name as tappable rows.
+    Each row displays spec and price; tapping sends "商品確認 <idx>".
+    variants: list of (global_idx, product_dict)
+    """
+    rows = []
+    for i, (global_idx, p) in enumerate(variants):
+        spec = p.get('spec', '') or '—'
+        price = p.get('price', 0)
+        rows.append(BoxComponent(
+            layout='horizontal',
+            action=MessageAction(label=f'選擇#{global_idx}', text=f'商品確認 {global_idx}'),
+            padding_all='md',
+            contents=[
+                BoxComponent(
+                    layout='vertical',
+                    flex=1,
+                    contents=[
+                        TextComponent(text=f'#{global_idx}', size='xxs', color='#AAAAAA'),
+                        TextComponent(text=spec, size='sm', wrap=True, color='#333333'),
+                    ],
+                ),
+                TextComponent(
+                    text=f'${price:,}',
+                    size='sm',
+                    align='end',
+                    gravity='center',
+                    color='#1DB446',
+                    weight='bold',
+                    flex=0,
+                ),
+            ],
+        ))
+        if i < len(variants) - 1:
+            rows.append(SeparatorComponent(margin='none', color='#DDDDDD'))
+
+    return BubbleContainer(
+        size='giga',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text=category_name, color='#FFFFFF', weight='bold',
+                              size='md', wrap=True),
+                TextComponent(text='請選擇規格', color='#CCFFCC', size='xs', margin='xs'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='none',
+            spacing='none',
+            contents=rows,
+        ),
+    )
+
+
+def _flex_product_detail(global_idx: int, product: dict):
+    """
+    Step 3: Product detail card — name, spec, price, index, and order instruction.
+    Instruction text uses no emoji per spec.
+    """
+    name = product.get('productName', '')
+    spec = product.get('spec', '')
+    price = product.get('price', 0)
+
+    body_items = [
+        TextComponent(text=name, weight='bold', size='md', wrap=True, color='#222222'),
+        SeparatorComponent(margin='md', color='#EEEEEE'),
+    ]
+    if spec:
+        body_items.append(BoxComponent(
+            layout='horizontal',
+            margin='md',
+            contents=[
+                TextComponent(text='規格', size='sm', color='#888888', flex=2),
+                TextComponent(text=spec, size='sm', wrap=True, flex=5, color='#444444'),
+            ],
+        ))
+    body_items.append(BoxComponent(
+        layout='horizontal',
+        margin='sm',
+        contents=[
+            TextComponent(text='單價', size='sm', color='#888888', flex=2),
+            TextComponent(text=f'${price:,}', size='sm', color='#1DB446',
+                          weight='bold', flex=5),
+        ],
+    ))
+    body_items.append(BoxComponent(
+        layout='horizontal',
+        margin='sm',
+        contents=[
+            TextComponent(text='商品編號', size='sm', color='#888888', flex=2),
+            TextComponent(text=str(global_idx), size='sm', color='#444444', flex=5),
+        ],
+    ))
+
+    return BubbleContainer(
+        size='kilo',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='md',
+            contents=[
+                TextComponent(text='商品資訊', color='#FFFFFF', size='sm', weight='bold'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='lg',
+            spacing='none',
+            contents=body_items,
+        ),
+        footer=BoxComponent(
+            layout='vertical',
+            background_color='#F5F5F5',
+            padding_all='lg',
+            spacing='xs',
+            contents=[
+                TextComponent(text='下單方式', size='sm', weight='bold', color='#555555'),
+                TextComponent(text=f'下單 {global_idx} 數量',
+                              size='sm', color='#333333', margin='sm'),
+                TextComponent(text=f'例: 下單 {global_idx} 2',
+                              size='xs', color='#AAAAAA'),
+            ],
+        ),
+    )
