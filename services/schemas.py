@@ -95,6 +95,7 @@ class OrderDoc:
     deliveryDate: Any = None               # datetime | None ; only mark_delivered sets it
     paidAt: Any = None                     # datetime | SERVER_TIMESTAMP | None
     createdAt: Any = None                  # datetime | SERVER_TIMESTAMP | None
+    deliveryAddress: str = ""              # 配送地址（空字串＝未指定）
 
     def validate(self) -> None:
         _require(isinstance(self.customerId, str) and self.customerId, "OrderDoc.customerId must be a non-empty str")
@@ -131,6 +132,7 @@ class OrderDoc:
                  "OrderDoc.paidAt must be a datetime, Firestore sentinel, or None")
         _require(_is_timestamp_like(self.createdAt),
                  "OrderDoc.createdAt must be a datetime, Firestore sentinel, or None")
+        _require(isinstance(self.deliveryAddress, str), "OrderDoc.deliveryAddress must be a str")
 
     def to_dict(self) -> dict:
         self.validate()
@@ -144,6 +146,7 @@ class OrderDoc:
             "paymentMethod": self.paymentMethod,
             "orderDate": self.orderDate,
             "deliveryDate": self.deliveryDate,
+            "deliveryAddress": self.deliveryAddress,
         }
         if self.paidAt is not None:
             d["paidAt"] = self.paidAt
