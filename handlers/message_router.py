@@ -4,11 +4,14 @@ from linebot import LineBotApi
 from linebot.models import (
     MessageEvent,
     BubbleContainer,
+    CarouselContainer,
     BoxComponent,
     TextComponent,
     ButtonComponent,
     SeparatorComponent,
+    FillerComponent,
     MessageAction,
+    URIAction,
 )
 
 # 匯入我們剛剛建立好的所有 Service 模組
@@ -18,6 +21,63 @@ from services.firebase_db import FirebaseDB
 from services.dev_mode import is_dev_mode, handle_dev_command, get_role_override
 
 logger = logging.getLogger(__name__)
+
+_pending_orders: dict[str, dict] = {}
+_boss_pending_orders: dict[str, dict] = {}
+
+_CUSTOMER_COMMAND_PREFIXES = (
+    "查看商品",
+    "商品類別",
+    "商品確認",
+    "下單",
+    "我的未付款",
+    "回報付款",
+    "直接聯絡老闆",
+    "聯絡老闆",
+)
+
+_BOSS_COMMAND_PREFIXES = (
+    "幫客戶下單",
+    "商品類別",
+    "商品確認",
+    "老闆下單",
+    "查詢客戶",
+    "客戶訂單",
+    "未付款清單",
+    "確認付款",
+    "送達",
+)
+
+
+def _starts_with_known_command(user_msg: str, prefixes: tuple[str, ...]) -> bool:
+    return any(user_msg == prefix or user_msg.startswith(prefix) for prefix in prefixes)
+
+
+def _product_summary_text(product_name: str, quantity: int, unit_price: int) -> str:
+    return f"{product_name} x{quantity}  ${unit_price * quantity:,}"
+
+
+def _build_customer_order_success_text(
+    order_id: str,
+    product_name: str,
+    spec: str,
+    quantity: int,
+    unit_price: int,
+    address: str,
+) -> str:
+    total = unit_price * quantity
+    spec_line = f"\n尺寸：{spec}" if spec else ""
+    return (
+        f"✅ 下單成功！\n"
+        f"訂單編號：{order_id}\n"
+        f"品項：{product_name} x {quantity}{spec_line}\n"
+        f"單價：${unit_price:,}\n"
+        f"總金額：${total:,}\n"
+        f"付款狀態：未付款\n"
+        f"配送狀態：尚未送達\n"
+        f"🏠 配送地址：{address}\n\n"
+        f"如有疑問請輸入「直接聯絡老闆」"
+    )
 
 def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
     """
@@ -76,8 +136,170 @@ def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
 def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg: str, user_id: str):
     """老闆端功能（兼任送貨回報）"""
 
+    if user_msg == "取消下單":
+        if _boss_pending_orders.pop(user_id, None) is not None:
+            reply_text = "已取消下單。"
+        else:
+            reply_text = "目前沒有進行中的下單流程。"
+
+    elif user_id in _boss_pending_orders and not _starts_with_known_command(user_msg, _BOSS_COMMAND_PREFIXES):
+        pending = _boss_pending_orders[user_id]
+        product = pending["product"]
+        product_name = product.get("productName", "")
+        spec = product.get("spec", "")
+        unit_price = int(product.get("price", 0) or 0)
+        quantity = pending["quantity"]
+        customer_name = pending["customer_name"]
+        customer_id = pending["customer_id"] or f"MANUAL_{customer_name}"
+        address = user_msg
+        try:
+            order_id, _ = FirebaseDB.create_order(
+                customer_id,
+                customer_name,
+                product_name,
+                spec,
+                quantity,
+                unit_price,
+                delivery_address=address,
+            )
+            _boss_pending_orders.pop(user_id, None)
+            items_str = f"{product_name} x{quantity}"
+            LineService.reply_flex(
+                line_bot_api,
+                event.reply_token,
+                "訂單建立成功",
+                _flex_boss_order_success(order_id, customer_name, items_str, unit_price * quantity, address),
+            )
+            return
+        except Exception as e:
+            logger.error(f"Boss order creation failed: {e}")
+            reply_text = "建立訂單時發生錯誤，請稍後再試。"
+
+    elif user_msg == "幫客戶下單":
+        try:
+            products = FirebaseDB.get_products()
+        except Exception as e:
+            logger.error(f"Failed to fetch products: {e}")
+            LineService.reply_text(line_bot_api, event.reply_token, "查詢商品時發生錯誤，請稍後再試。")
+            return
+
+        if not products:
+            LineService.reply_text(line_bot_api, event.reply_token, "目前暫無上架商品，請稍後再查詢。")
+            return
+
+        LineService.reply_flex(line_bot_api, event.reply_token, "商品目錄", _flex_category_picker(products))
+        return
+
+    elif user_msg.startswith("商品類別"):
+        category_name = user_msg[4:].strip()
+        try:
+            products = FirebaseDB.get_products()
+        except Exception as e:
+            logger.error(f"Failed to fetch products: {e}")
+            LineService.reply_text(line_bot_api, event.reply_token, "查詢商品時發生錯誤，請稍後再試。")
+            return
+
+        variants = [
+            (idx, p) for idx, p in enumerate(products, start=1)
+            if p.get('productName') == category_name
+        ]
+        if not variants:
+            LineService.reply_text(line_bot_api, event.reply_token,
+                                   f"找不到商品「{category_name}」，請輸入「幫客戶下單」重新選擇。")
+            return
+
+        if len(variants) == 1:
+            global_idx, product = variants[0]
+            LineService.reply_flex(line_bot_api, event.reply_token,
+                                   f"商品資訊 #{global_idx}", _flex_product_detail(global_idx, product))
+        else:
+            LineService.reply_flex(line_bot_api, event.reply_token,
+                                   f"{category_name} 規格選擇", _flex_spec_picker(category_name, variants))
+        return
+
+    elif user_msg.startswith("商品確認"):
+        try:
+            idx = int(user_msg[4:].strip())
+        except ValueError:
+            LineService.reply_text(line_bot_api, event.reply_token, "無效的商品編號，請重新選擇。")
+            return
+
+        try:
+            products = FirebaseDB.get_products()
+        except Exception as e:
+            logger.error(f"Failed to fetch products: {e}")
+            LineService.reply_text(line_bot_api, event.reply_token, "查詢商品時發生錯誤，請稍後再試。")
+            return
+
+        if idx < 1 or idx > len(products):
+            LineService.reply_text(line_bot_api, event.reply_token,
+                                   f"商品編號 {idx} 不存在，請輸入「幫客戶下單」重新選擇。")
+            return
+
+        LineService.reply_flex(line_bot_api, event.reply_token,
+                               f"商品資訊 #{idx}", _flex_product_detail(idx, products[idx - 1]))
+        return
+
+    elif user_msg.startswith("老闆下單"):
+        parts = user_msg.split(maxsplit=3)
+        if len(parts) != 4:
+            reply_text = (
+                "格式不正確，請輸入：\n"
+                "老闆下單 編號 數量 客戶名稱\n"
+                "例：老闆下單 3 2 王小明"
+            )
+        else:
+            _, idx_str, qty_str, customer_name = parts
+            try:
+                idx = int(idx_str)
+                quantity = int(qty_str)
+                if quantity <= 0:
+                    raise ValueError
+            except ValueError:
+                reply_text = "編號與數量請輸入正整數\n例：老闆下單 3 2 王小明"
+            else:
+                try:
+                    products = FirebaseDB.get_products()
+                    if idx < 1 or idx > len(products):
+                        reply_text = (
+                            f"編號 {idx} 不存在，請先輸入「幫客戶下單」確認正確編號"
+                            f"（1 ～ {len(products)}）。"
+                        )
+                    else:
+                        customers = FirebaseDB.search_customers_by_name(customer_name)
+                        if len(customers) > 1:
+                            lines = [f"找到多位符合「{customer_name}」的客戶，請輸入更完整的姓名："]
+                            for customer in customers:
+                                lines.append(f"• {customer.get('displayName', '未知客戶')}")
+                            reply_text = "\n".join(lines)
+                        else:
+                            customer = customers[0] if customers else None
+                            product = products[idx - 1]
+                            unit_price = int(product.get("price", 0) or 0)
+                            resolved_name = customer.get("displayName", customer_name) if customer else customer_name
+                            _boss_pending_orders[user_id] = {
+                                "product_idx": idx,
+                                "quantity": quantity,
+                                "customer_name": resolved_name,
+                                "customer_id": customer.get("userId", "") if customer else "",
+                                "product": product,
+                            }
+                            LineService.reply_flex(
+                                line_bot_api,
+                                event.reply_token,
+                                "輸入客戶配送地址",
+                                _flex_boss_address_prompt(
+                                    resolved_name,
+                                    _product_summary_text(product.get("productName", ""), quantity, unit_price),
+                                ),
+                            )
+                            return
+                except Exception as e:
+                    logger.error(f"Boss pending order creation failed: {e}")
+                    reply_text = "建立訂單流程時發生錯誤，請稍後再試。"
+
     # ── 查詢客戶 <關鍵字> ─────────────────────────────────────────────
-    if user_msg.startswith("查詢客戶"):
+    elif user_msg.startswith("查詢客戶"):
         keyword = user_msg[4:].strip()
         if not keyword:
             reply_text = "請在「查詢客戶」後面加上搜尋關鍵字，例：\n查詢客戶 王"
@@ -238,6 +460,7 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
     else:
         reply_text = (
             "老闆您好！可用指令如下：\n"
+            "• 輸入「幫客戶下單」替客戶下訂單\n"
             "• 輸入「查詢客戶 關鍵字」模糊搜尋客戶\n"
             "• 輸入「客戶訂單 姓名」查看客戶歷史訂單\n"
             "• 輸入「未付款清單 本週／本月／近兩個月／近三個月」查看未付款訂單\n"
@@ -251,8 +474,45 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
 def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg: str, user_id: str, display_name: str):
     """客戶端功能"""
 
+    if user_msg == "取消下單":
+        if _pending_orders.pop(user_id, None) is not None:
+            reply_text = "已取消下單。"
+        else:
+            reply_text = "目前沒有進行中的下單流程。"
+
+    elif user_id in _pending_orders and not _starts_with_known_command(user_msg, _CUSTOMER_COMMAND_PREFIXES):
+        pending = _pending_orders[user_id]
+        product = pending["product"]
+        product_name = product.get("productName", "")
+        spec = product.get("spec", "")
+        quantity = pending["quantity"]
+        unit_price = int(product.get("price", 0) or 0)
+        address = user_msg
+        try:
+            order_id, _ = FirebaseDB.create_order(
+                user_id,
+                display_name,
+                product_name,
+                spec,
+                quantity,
+                unit_price,
+                delivery_address=address,
+            )
+            _pending_orders.pop(user_id, None)
+            reply_text = _build_customer_order_success_text(
+                order_id,
+                product_name,
+                spec,
+                quantity,
+                unit_price,
+                address,
+            )
+        except Exception as e:
+            logger.error(f"Order creation failed: {e}")
+            reply_text = "下單時發生錯誤，請稍後再試或聯絡老闆。"
+
     # ── 查看商品：Step 1 — 商品類別選擇 ──────────────────────────────────
-    if user_msg == "查看商品":
+    elif user_msg == "查看商品":
         try:
             products = FirebaseDB.get_products()
         except Exception as e:
@@ -344,24 +604,21 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                         )
                     else:
                         product = products[idx - 1]
-                        product_name = product.get('productName', '')
-                        spec = product.get('spec', '')
                         unit_price = int(product.get('price', 0) or 0)
-                        order_id, _ = FirebaseDB.create_order(
-                            user_id, display_name, product_name, spec, quantity, unit_price
+                        _pending_orders[user_id] = {
+                            "product_idx": idx,
+                            "quantity": quantity,
+                            "product": product,
+                        }
+                        LineService.reply_flex(
+                            line_bot_api,
+                            event.reply_token,
+                            "輸入配送地址",
+                            _flex_customer_address_prompt(
+                                _product_summary_text(product.get("productName", ""), quantity, unit_price),
+                            ),
                         )
-                        total = unit_price * quantity
-                        spec_line = f"\n尺寸：{spec}" if spec else ""
-                        reply_text = (
-                            f"✅ 下單成功！\n"
-                            f"訂單編號：{order_id}\n"
-                            f"品項：{product_name} x {quantity}{spec_line}\n"
-                            f"單價：${unit_price}\n"
-                            f"總金額：${total}\n"
-                            f"付款狀態：未付款\n"
-                            f"配送狀態：尚未送達\n\n"
-                            f"如有疑問請輸入「聯絡老闆 您的問題」"
-                        )
+                        return
                 except Exception as e:
                     logger.error(f"Order creation failed: {e}")
                     reply_text = "下單時發生錯誤，請稍後再試或聯絡老闆。"
@@ -463,21 +720,18 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                     reply_text = "回報付款時發生錯誤，請稍後再試。"
 
     # ── 聯絡老闆 <訊息內容> ────────────────────────────────────────────
-    elif user_msg.startswith("聯絡老闆"):
-        message_content = user_msg[4:].strip()
-        if not message_content:
-            reply_text = "請在「聯絡老闆」後面加上您的訊息，例：\n聯絡老闆 我想詢問水蜜桃的產地資訊"
-        elif not Config.BOSS_LINE_ID:
+    elif user_msg == "直接聯絡老闆" or user_msg == "聯絡老闆":
+        if not Config.BOSS_LINE_ID:
             logger.error("BOSS_LINE_ID is not configured.")
-            reply_text = "目前無法轉達訊息，請稍後再試。"
+            reply_text = "目前無法連結到老闆，請稍後再試。"
         else:
-            try:
-                push_msg = f"📩 客戶留言\n來自：{display_name}\n\n{message_content}"
-                LineService.push_text(line_bot_api, Config.BOSS_LINE_ID, push_msg)
-                reply_text = "✅ 已將您的訊息轉達給老闆，請耐心等候回覆。"
-            except Exception as e:
-                logger.error(f"Failed to push message to boss: {e}")
-                reply_text = "訊息傳送失敗，請稍後再試。"
+            LineService.reply_flex(
+                line_bot_api,
+                event.reply_token,
+                "聯絡老闆",
+                _flex_contact_boss_card(Config.BOSS_LINE_ID),
+            )
+            return
 
     # ── 預設提示 ──────────────────────────────────────────────────────
     else:
@@ -487,7 +741,8 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
             "• 輸入「下單 編號 數量」下單（編號請先查看商品取得）\n"
             "• 輸入「我的未付款」查看您尚未付款的訂單\n"
             "• 輸入「回報付款 序號」通知老闆您已付款（序號請先查看「我的未付款」）\n"
-            "• 輸入「聯絡老闆 訊息內容」與老闆溝通"
+            "• 輸入「直接聯絡老闆」立即開啟與老闆的對話\n"
+            "• 快速輸入「直接聯絡老闆」即可直接聯繫老闆"
         )
 
     LineService.reply_text(line_bot_api, event.reply_token, reply_text)
@@ -659,10 +914,185 @@ def _flex_product_detail(global_idx: int, product: dict):
             spacing='xs',
             contents=[
                 TextComponent(text='下單方式', size='sm', weight='bold', color='#555555'),
-                TextComponent(text=f'下單 {global_idx} 數量',
+                TextComponent(text=f'客戶：下單 {global_idx} 數量',
                               size='sm', color='#333333', margin='sm'),
+                TextComponent(text=f'老闆：老闆下單 {global_idx} 數量 客戶名稱',
+                              size='sm', color='#333333'),
                 TextComponent(text=f'例: 下單 {global_idx} 2',
                               size='xs', color='#AAAAAA'),
+            ],
+        ),
+    )
+
+
+def _flex_customer_address_prompt(items_summary: str):
+    return BubbleContainer(
+        size='giga',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text='📦 輸入配送地址', color='#FFFFFF', weight='bold', size='lg'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='lg',
+            contents=[
+                TextComponent(text=items_summary, wrap=True, weight='bold', size='md', color='#222222'),
+                SeparatorComponent(margin='md', color='#EEEEEE'),
+                TextComponent(
+                    text='請直接輸入送貨地址，例如：\n台北市大安區忠孝東路四段 1 號',
+                    wrap=True,
+                    margin='md',
+                    size='sm',
+                    color='#444444',
+                ),
+                TextComponent(
+                    text='如需取消請輸入「取消下單」',
+                    wrap=True,
+                    margin='md',
+                    size='xs',
+                    color='#888888',
+                ),
+            ],
+        ),
+    )
+
+
+def _flex_boss_address_prompt(customer_name: str, items_summary: str):
+    return BubbleContainer(
+        size='giga',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text='📦 輸入客戶配送地址', color='#FFFFFF', weight='bold', size='lg'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='lg',
+            contents=[
+                BoxComponent(
+                    layout='horizontal',
+                    margin='md',
+                    contents=[
+                        TextComponent(text='客戶', size='sm', color='#888888', flex=2),
+                        TextComponent(text=customer_name, size='sm', wrap=True, color='#222222', flex=5),
+                    ],
+                ),
+                BoxComponent(
+                    layout='horizontal',
+                    margin='md',
+                    contents=[
+                        TextComponent(text='品項', size='sm', color='#888888', flex=2),
+                        TextComponent(text=items_summary, size='sm', wrap=True, color='#222222', flex=5),
+                    ],
+                ),
+                SeparatorComponent(margin='md', color='#EEEEEE'),
+                TextComponent(
+                    text='請直接輸入送貨地址，例如：\n台北市大安區忠孝東路四段 1 號',
+                    wrap=True,
+                    margin='md',
+                    size='sm',
+                    color='#444444',
+                ),
+                TextComponent(
+                    text='如需取消請輸入「取消下單」',
+                    wrap=True,
+                    margin='md',
+                    size='xs',
+                    color='#888888',
+                ),
+            ],
+        ),
+    )
+
+
+def _flex_boss_order_success(order_id: str, customer_name: str, items_str: str, total: int, address: str):
+    def _row(label: str, value: str):
+        return BoxComponent(
+            layout='horizontal',
+            margin='md',
+            contents=[
+                TextComponent(text=label, size='sm', color='#888888', flex=2),
+                TextComponent(text=value, size='sm', wrap=True, color='#222222', flex=5),
+            ],
+        )
+
+    return BubbleContainer(
+        size='giga',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text='✅ 訂單建立成功', color='#FFFFFF', weight='bold', size='lg'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='lg',
+            contents=[
+                _row('客戶', customer_name),
+                _row('品項', items_str),
+                _row('金額', f'${total:,}'),
+                _row('地址', address),
+                _row('訂單號', order_id),
+            ],
+        ),
+        footer=BoxComponent(
+            layout='vertical',
+            padding_all='lg',
+            contents=[
+                TextComponent(
+                    text='付款方式及狀態可於管理後台更新',
+                    size='xs',
+                    color='#888888',
+                    wrap=True,
+                ),
+            ],
+        ),
+    )
+
+
+def _flex_contact_boss_card(boss_id: str):
+    line_url = f"https://line.me/R/ti/p/{boss_id}"
+    return BubbleContainer(
+        size='giga',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text='💬 聯絡老闆', color='#FFFFFF', weight='bold', size='lg'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='lg',
+            contents=[
+                TextComponent(
+                    text='點擊下方按鈕，即可直接開啟與老闆的對話視窗。',
+                    wrap=True,
+                    size='sm',
+                    color='#444444',
+                ),
+            ],
+        ),
+        footer=BoxComponent(
+            layout='vertical',
+            padding_all='lg',
+            contents=[
+                FillerComponent(),
+                ButtonComponent(
+                    style='primary',
+                    color='#2C7A4B',
+                    action=URIAction(label='開啟與老闆的對話', uri=line_url),
+                ),
             ],
         ),
     )

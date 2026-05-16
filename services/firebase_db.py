@@ -104,6 +104,7 @@ class FirebaseDB:
         spec: str,
         quantity: int,
         unit_price: int,
+        delivery_address: str = "",
     ) -> tuple:
         """
         建立新訂單，寫入 Firestore Orders 集合。
@@ -139,6 +140,7 @@ class FirebaseDB:
             orderDate=firestore.SERVER_TIMESTAMP,
             deliveryDate=None,                          # 尚未配送 → None
             createdAt=firestore.SERVER_TIMESTAMP,
+            deliveryAddress=delivery_address,
         )
         payload = order.to_dict()
 
