@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _pending_orders: dict[str, dict] = {}
 _boss_pending_orders: dict[str, dict] = {}
+# Prefix used when the boss creates an order for a customer not yet mapped to a LINE user ID.
 _MANUAL_CUSTOMER_PREFIX = "MANUAL_"
 
 _CUSTOMER_COMMAND_PREFIXES = (
@@ -56,6 +57,10 @@ def _starts_with_known_command(user_msg: str, prefixes: tuple[str, ...]) -> bool
 
 def _product_summary_text(product_name: str, quantity: int, unit_price: int) -> str:
     return f"{product_name} x{quantity}  ${unit_price * quantity:,}"
+
+
+def _product_unit_price(product: dict) -> int:
+    return int(product.get("price", 0) or 0)
 
 
 def _build_customer_order_success_text(
@@ -148,7 +153,7 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
         product = pending["product"]
         product_name = product.get("productName", "")
         spec = product.get("spec", "")
-        unit_price = int(product.get("price", 0) or 0)
+        unit_price = _product_unit_price(product)
         quantity = pending["quantity"]
         customer_name = pending["customer_name"]
         customer_id = pending["customer_id"] or f"{_MANUAL_CUSTOMER_PREFIX}{customer_name}"
@@ -276,7 +281,7 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                         else:
                             customer = customers[0] if customers else None
                             product = products[idx - 1]
-                            unit_price = int(product.get("price", 0) or 0)
+                            unit_price = _product_unit_price(product)
                             resolved_name = customer.get("displayName", customer_name) if customer else customer_name
                             _boss_pending_orders[user_id] = {
                                 "product_idx": idx,
@@ -487,7 +492,7 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
         product_name = product.get("productName", "")
         spec = product.get("spec", "")
         quantity = pending["quantity"]
-        unit_price = int(product.get("price", 0) or 0)
+        unit_price = _product_unit_price(product)
         address = user_msg
         try:
             order_id, _ = FirebaseDB.create_order(
@@ -605,7 +610,7 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                         )
                     else:
                         product = products[idx - 1]
-                        unit_price = int(product.get('price', 0) or 0)
+                        unit_price = _product_unit_price(product)
                         _pending_orders[user_id] = {
                             "product_idx": idx,
                             "quantity": quantity,
@@ -1058,6 +1063,7 @@ def _flex_boss_order_success(order_id: str, customer_name: str, items_str: str, 
 
 
 def _flex_contact_boss_card(boss_id: str):
+    # LINE deep-link that opens the direct chat window for the configured boss account.
     line_url = f"https://line.me/R/ti/p/{boss_id}"
     return BubbleContainer(
         size='giga',
