@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _pending_orders: dict[str, dict] = {}
 _boss_pending_orders: dict[str, dict] = {}
+_MANUAL_CUSTOMER_PREFIX = "MANUAL_"
 
 _CUSTOMER_COMMAND_PREFIXES = (
     "查看商品",
@@ -150,7 +151,7 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
         unit_price = int(product.get("price", 0) or 0)
         quantity = pending["quantity"]
         customer_name = pending["customer_name"]
-        customer_id = pending["customer_id"] or f"MANUAL_{customer_name}"
+        customer_id = pending["customer_id"] or f"{_MANUAL_CUSTOMER_PREFIX}{customer_name}"
         address = user_msg
         try:
             order_id, _ = FirebaseDB.create_order(
