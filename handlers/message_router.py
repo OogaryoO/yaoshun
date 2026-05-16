@@ -741,8 +741,7 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
             "• 輸入「下單 編號 數量」下單（編號請先查看商品取得）\n"
             "• 輸入「我的未付款」查看您尚未付款的訂單\n"
             "• 輸入「回報付款 序號」通知老闆您已付款（序號請先查看「我的未付款」）\n"
-            "• 輸入「直接聯絡老闆」立即開啟與老闆的對話\n"
-            "• 快速輸入「直接聯絡老闆」即可直接聯繫老闆"
+            "• 輸入「直接聯絡老闆」立即開啟與老闆的對話"
         )
 
     LineService.reply_text(line_bot_api, event.reply_token, reply_text)
@@ -914,10 +913,8 @@ def _flex_product_detail(global_idx: int, product: dict):
             spacing='xs',
             contents=[
                 TextComponent(text='下單方式', size='sm', weight='bold', color='#555555'),
-                TextComponent(text=f'客戶：下單 {global_idx} 數量',
+                TextComponent(text=f'下單 {global_idx} 數量',
                               size='sm', color='#333333', margin='sm'),
-                TextComponent(text=f'老闆：老闆下單 {global_idx} 數量 客戶名稱',
-                              size='sm', color='#333333'),
                 TextComponent(text=f'例: 下單 {global_idx} 2',
                               size='xs', color='#AAAAAA'),
             ],
