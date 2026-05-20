@@ -43,6 +43,7 @@ _BOSS_COMMAND_PREFIXES = (
     "商品類別",
     "商品確認",
     "老闆下單",
+    "下單",
     "查詢客戶",
     "客戶訂單",
     "未付款清單",
@@ -150,36 +151,136 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
 
     elif user_id in _boss_pending_orders and not _starts_with_known_command(user_msg, _BOSS_COMMAND_PREFIXES):
         pending = _boss_pending_orders[user_id]
-        product = pending["product"]
-        product_name = product.get("productName", "")
-        spec = product.get("spec", "")
-        unit_price = _product_unit_price(product)
-        quantity = pending["quantity"]
-        customer_name = pending["customer_name"]
-        customer_id = pending["customer_id"] or f"{_MANUAL_CUSTOMER_PREFIX}{customer_name}"
-        address = user_msg
-        try:
-            order_id, _ = FirebaseDB.create_order(
-                customer_id,
-                customer_name,
-                product_name,
-                spec,
-                quantity,
-                unit_price,
-                delivery_address=address,
-            )
-            _boss_pending_orders.pop(user_id, None)
-            items_str = f"{product_name} x{quantity}"
-            LineService.reply_flex(
-                line_bot_api,
-                event.reply_token,
-                "訂單建立成功",
-                _flex_boss_order_success(order_id, customer_name, items_str, unit_price * quantity, address),
-            )
-            return
-        except Exception as e:
-            logger.error(f"Boss order creation failed: {e}")
-            reply_text = "建立訂單時發生錯誤，請稍後再試。"
+        stage = pending.get("stage", "awaiting_address")
+
+        # ── 客戶名稱搜尋（初次輸入 或 在 selecting 階段重新搜尋）──────────
+        if stage in ("awaiting_customer", "selecting_customer"):
+            # In selecting stage, a non-digit input is treated as a new search
+            if stage == "selecting_customer" and user_msg.strip().isdigit():
+                candidates = pending.get("candidates", [])
+                choice = int(user_msg.strip())
+                if 1 <= choice <= len(candidates):
+                    customer = candidates[choice - 1]
+                    resolved_name = customer.get("displayName", "")
+                    _boss_pending_orders[user_id]["customer_name"] = resolved_name
+                    _boss_pending_orders[user_id]["customer_id"] = customer.get("userId", "")
+                    _boss_pending_orders[user_id]["stage"] = "awaiting_address"
+                    _boss_pending_orders[user_id].pop("candidates", None)
+                    product = pending["product"]
+                    quantity = pending["quantity"]
+                    unit_price = _product_unit_price(product)
+                    LineService.reply_flex(
+                        line_bot_api,
+                        event.reply_token,
+                        "輸入客戶配送地址",
+                        _flex_boss_address_prompt(
+                            resolved_name,
+                            _product_summary_text(product.get("productName", ""), quantity, unit_price),
+                        ),
+                    )
+                    return
+                else:
+                    candidates = pending.get("candidates", [])
+                    reply_text = f"請輸入 1 到 {len(candidates)} 之間的編號，或輸入其他姓名重新搜尋。"
+            else:
+                # Search (or re-search) by name
+                if stage == "selecting_customer":
+                    _boss_pending_orders[user_id]["stage"] = "awaiting_customer"
+                    _boss_pending_orders[user_id].pop("candidates", None)
+                customer_name = user_msg.strip()
+                try:
+                    customers = FirebaseDB.search_customers_by_name(customer_name)
+                except Exception as e:
+                    logger.error(f"Customer search in boss pending order failed: {e}")
+                    LineService.reply_text(line_bot_api, event.reply_token, "查詢客戶時發生錯誤，請稍後再試。")
+                    return
+
+                if len(customers) == 0:
+                    # New customer — create a real record in Firebase
+                    try:
+                        new_id = FirebaseDB.create_manual_customer(customer_name)
+                    except Exception as e:
+                        logger.error(f"create_manual_customer failed: {e}")
+                        LineService.reply_text(line_bot_api, event.reply_token, "建立新客戶時發生錯誤，請稍後再試。")
+                        return
+                    _boss_pending_orders[user_id]["customer_name"] = customer_name
+                    _boss_pending_orders[user_id]["customer_id"] = new_id
+                    _boss_pending_orders[user_id]["stage"] = "awaiting_address"
+                    product = pending["product"]
+                    quantity = pending["quantity"]
+                    unit_price = _product_unit_price(product)
+                    LineService.reply_flex(
+                        line_bot_api,
+                        event.reply_token,
+                        "輸入客戶配送地址",
+                        _flex_boss_address_prompt(
+                            f"{customer_name}（新客戶）",
+                            _product_summary_text(product.get("productName", ""), quantity, unit_price),
+                        ),
+                    )
+                    return
+
+                elif len(customers) == 1:
+                    customer = customers[0]
+                    resolved_name = customer.get("displayName", customer_name)
+                    _boss_pending_orders[user_id]["customer_name"] = resolved_name
+                    _boss_pending_orders[user_id]["customer_id"] = customer.get("userId", "")
+                    _boss_pending_orders[user_id]["stage"] = "awaiting_address"
+                    product = pending["product"]
+                    quantity = pending["quantity"]
+                    unit_price = _product_unit_price(product)
+                    LineService.reply_flex(
+                        line_bot_api,
+                        event.reply_token,
+                        "輸入客戶配送地址",
+                        _flex_boss_address_prompt(
+                            resolved_name,
+                            _product_summary_text(product.get("productName", ""), quantity, unit_price),
+                        ),
+                    )
+                    return
+
+                else:
+                    # Multiple matches — let boss pick by number
+                    _boss_pending_orders[user_id]["candidates"] = customers
+                    _boss_pending_orders[user_id]["stage"] = "selecting_customer"
+                    lines = [f"找到 {len(customers)} 位符合「{customer_name}」的客戶，請輸入編號選擇："]
+                    for i, c in enumerate(customers, start=1):
+                        lines.append(f"{i}. {c.get('displayName', '未知客戶')}")
+                    lines.append("\n也可輸入其他姓名重新搜尋")
+                    reply_text = "\n".join(lines)
+
+        else:  # awaiting_address
+            product = pending["product"]
+            product_name = product.get("productName", "")
+            spec = product.get("spec", "")
+            unit_price = _product_unit_price(product)
+            quantity = pending["quantity"]
+            customer_name = pending["customer_name"]
+            customer_id = pending["customer_id"] or f"{_MANUAL_CUSTOMER_PREFIX}{customer_name}"
+            address = user_msg
+            try:
+                order_id, _ = FirebaseDB.create_order(
+                    customer_id,
+                    customer_name,
+                    product_name,
+                    spec,
+                    quantity,
+                    unit_price,
+                    delivery_address=address,
+                )
+                _boss_pending_orders.pop(user_id, None)
+                items_str = f"{product_name} x{quantity}"
+                LineService.reply_flex(
+                    line_bot_api,
+                    event.reply_token,
+                    "訂單建立成功",
+                    _flex_boss_order_success(order_id, customer_name, items_str, unit_price * quantity, address),
+                )
+                return
+            except Exception as e:
+                logger.error(f"Boss order creation failed: {e}")
+                reply_text = "建立訂單時發生錯誤，請稍後再試。"
 
     elif user_msg == "幫客戶下單":
         try:
@@ -461,6 +562,45 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
             except Exception as e:
                 logger.error(f"mark_delivered failed: {e}")
                 reply_text = "標記送達時發生錯誤，請稍後再試。"
+
+    # ── 下單 <編號> <數量>（由「幫客戶下單」流程引導而來）──────────────────
+    elif user_msg.startswith("下單"):
+        parts = user_msg.split()
+        if len(parts) != 3:
+            reply_text = "格式不正確，請輸入：\n下單 編號 數量\n先輸入「幫客戶下單」取得編號\n例：下單 12 4"
+        else:
+            try:
+                idx = int(parts[1])
+                quantity = int(parts[2])
+                if quantity <= 0:
+                    raise ValueError
+            except ValueError:
+                reply_text = "編號與數量請輸入正整數\n例：下單 12 4"
+            else:
+                try:
+                    products = FirebaseDB.get_products()
+                    if idx < 1 or idx > len(products):
+                        reply_text = (
+                            f"商品編號 {idx} 不存在，請輸入「幫客戶下單」重新選擇"
+                            f"（1 ～ {len(products)}）。"
+                        )
+                    else:
+                        product = products[idx - 1]
+                        _boss_pending_orders[user_id] = {
+                            "product_idx": idx,
+                            "quantity": quantity,
+                            "product": product,
+                            "stage": "awaiting_customer",
+                        }
+                        unit_price = _product_unit_price(product)
+                        product_name = product.get("productName", "")
+                        reply_text = (
+                            f"已選擇：{product_name} x{quantity}（${unit_price * quantity:,}）\n\n"
+                            f"請輸入客戶姓名（系統將自動比對客戶資料）："
+                        )
+                except Exception as e:
+                    logger.error(f"Boss 下單 init failed: {e}")
+                    reply_text = "查詢商品時發生錯誤，請稍後再試。"
 
     # ── 預設提示 ──────────────────────────────────────────────────────
     else:
