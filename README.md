@@ -15,6 +15,44 @@ uncle-line-bot/
     └── message_router.py  # 根據使用者身分 (老闆/司機/客戶) 將訊息導向對應模組
 ```
 
+## 環境變數 (.env)
+
+本專案使用 `python-dotenv` 讀取本機 `.env` 檔案，`config.py` 會根據下列變數初始化系統設定。
+
+建議 `.env` 至少設定前 3 項；若要啟用 Google 試算表、老闆通知、Rich Menu 綁定，請補上第 4~7 項。
+
+```env
+# 1. LINE Messaging API 的 Channel Access Token
+LINE_CHANNEL_ACCESS_TOKEN=你的 channel access token
+
+# 2. LINE Messaging API 的 Channel Secret
+LINE_CHANNEL_SECRET=你的 channel secret
+
+# 3. Google Firebase 憑證 JSON（整段 JSON 字串）
+GOOGLE_CREDENTIALS_JSON={"type": "service_account", ...}
+
+# 4. Google Sheet ID（如果你使用 sheets_service.py 或 Google 試算表功能）
+GOOGLE_SHEET_ID=你的 Google Sheet ID
+
+# 5. 老闆的 LINE User ID（負責接收客戶付款回報通知）
+BOSS_LINE_ID=Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 6. 客戶用 Rich Menu ID（綁定客戶角色專屬功能選單）
+CUSTOMER_RICH_MENU_ID=你的 customer rich menu id
+
+# 7. 老闆用 Rich Menu ID（綁定老闆角色專屬功能選單）
+BOSS_RICH_MENU_ID=你的 boss rich menu id
+
+# 8. 本機開發模式：true 表示啟用 DEV_MODE，不建議正式環境開啟
+DEV_MODE=false
+```
+
+### 參考註記
+- `GOOGLE_SHEET_ID`：只要你不使用 Google 試算表功能，可先留空。
+- `BOSS_LINE_ID`：若未設定，客戶「回報付款」功能仍可執行，但無法推播通知給老闆。
+- `CUSTOMER_RICH_MENU_ID` / `BOSS_RICH_MENU_ID`：若未設定，系統會跳過 Rich Menu 綁定，LINE 使用者仍可透過文字指令互動。
+- `DEV_MODE`：僅供本機開發測試使用，正式上線請保持 `false` 或移除。
+
 ## 總覽 (Collections Overview)
 
 系統由三個核心的 Collection (集合) 組成：

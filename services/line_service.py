@@ -1,7 +1,9 @@
 import logging
 from linebot import LineBotApi
-from linebot.models import FlexSendMessage, TextSendMessage
 from linebot.exceptions import LineBotApiError
+from linebot.models import FlexSendMessage, TextSendMessage
+
+from config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,47 @@ class LineService:
             logger.error(f"LINE API Error (reply flex): {e.status_code} {e.error.message}")
         except Exception as e:
             logger.error(f"Unexpected error in reply_flex: {e}", exc_info=True)
+
+    @staticmethod
+    def bind_rich_menu_to_user(line_bot_api: LineBotApi, user_id: str, rich_menu_id: str):
+        """綁定指定 rich menu 到單一使用者。"""
+        if not rich_menu_id:
+            logger.warning(f"No rich menu ID configured for binding user {user_id}.")
+            return
+
+        try:
+            line_bot_api.link_rich_menu_to_user(user_id, rich_menu_id)
+            logger.info(f"Bound rich menu {rich_menu_id} to user {user_id}.")
+        except LineBotApiError as e:
+            logger.error(f"LINE API Error (bind rich menu): {e.status_code} {e.error.message}")
+        except Exception as e:
+            logger.error(f"Unexpected error in bind_rich_menu_to_user: {e}", exc_info=True)
+
+    @staticmethod
+    def ensure_user_rich_menu(line_bot_api: LineBotApi, user_id: str, role: str):
+        """確認使用者是否已綁定正確角色的 rich menu，若沒有則重新綁定。"""
+        expected_rich_menu_id = Config.BOSS_RICH_MENU_ID if role == 'boss' else Config.CUSTOMER_RICH_MENU_ID
+        if not expected_rich_menu_id:
+            logger.warning(f"Expected rich menu ID for role '{role}' is not configured.")
+            return
+
+        try:
+            current_rich_menu_id = line_bot_api.get_rich_menu_id_of_user(user_id)
+        except LineBotApiError as e:
+            if e.status_code == 404:
+                current_rich_menu_id = None
+            else:
+                logger.error(f"LINE API Error (get rich menu id): {e.status_code} {e.error.message}")
+                return
+        except Exception as e:
+            logger.error(f"Unexpected error in ensure_user_rich_menu: {e}", exc_info=True)
+            return
+
+        if current_rich_menu_id == expected_rich_menu_id:
+            logger.debug(f"User {user_id} already has the correct rich menu bound.")
+            return
+
+        LineService.bind_rich_menu_to_user(line_bot_api, user_id, expected_rich_menu_id)
 
     @staticmethod
     def reply_liff_menu(line_bot_api: LineBotApi, reply_token: str, role: str):

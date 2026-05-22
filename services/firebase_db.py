@@ -248,7 +248,7 @@ class FirebaseDB:
     def search_customers_by_name(keyword: str) -> list:
         """
         模糊搜尋客戶：撈取所有 role=customer 的使用者，
-        在 Python 端以 keyword 做不分大小寫的子字串比對。
+        �� Python 端以 keyword 做不分大小寫的子字串比對。
         """
         keyword_lower = keyword.lower()
         results = []
@@ -259,25 +259,6 @@ class FirebaseDB:
                 data['userId'] = doc.id
                 results.append(data)
         return results
-
-    @staticmethod
-    def create_manual_customer(display_name: str) -> str:
-        """
-        為老闆手動建立的非 LINE 客戶在 Users 集合中建立一筆記錄。
-        使用帶前綴的隨機 ID，使其可在後續搜尋中被找到。
-        回傳生成的 user_id。
-        """
-        generated_id = f"MANUAL_{secrets.token_hex(8)}"
-        payload = UserDoc(
-            role="customer",
-            displayName=display_name or "Unknown",
-            phone="",
-            notes="",
-            createdAt=firestore.SERVER_TIMESTAMP,
-        ).to_dict()
-        db.collection('Users').document(generated_id).set(payload)
-        logger.info(f"Created manual customer '{display_name}' with ID {generated_id}.")
-        return generated_id
 
     @staticmethod
     def notify_payment(order_id: str, user_id: str) -> dict:
