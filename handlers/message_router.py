@@ -28,6 +28,9 @@ _customer_next_input_mode: dict[str, str] = {}
 _customer_pending_data: dict[str, dict] = {}
 _boss_next_input_mode: dict[str, str] = {}
 _boss_pending_data: dict[str, dict] = {}
+# Stores the last list of customers returned by "查詢客戶" for each boss.
+# Used by "客戶訂單" to display a flex customer picker.
+_boss_last_search_customers: dict[str, list] = {}
 # Prefix used when the boss creates an order for a customer not yet mapped to a LINE user ID.
 _MANUAL_CUSTOMER_PREFIX = "MANUAL_"
 
@@ -103,6 +106,15 @@ def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
     user_id = event.source.user_id
     user_msg = event.message.text.strip()
 
+    # 記錄每位使用者的系統 UID，方便設定 BOSS_LINE_ID
+    logger.info(f"Incoming message | LINE UID: {user_id} | text: {user_msg!r}")
+
+    # ── 特殊指令：回傳自己的 LINE UID（用於設定 BOSS_LINE_ID） ──────
+    if user_msg == "myuid":
+        LineService.reply_text(line_bot_api, event.reply_token, f"你的 LINE UID：\n{user_id}")
+        return
+    # ───────────────────────────────────────────────────────────────
+
     # ── 本機開發模式：角色切換指令攔截 ──────────────────────────────
     if is_dev_mode():
         dev_reply = handle_dev_command(user_id, user_msg)
@@ -169,13 +181,15 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                     reply_text = "查詢客戶時發生錯誤，請稍後再試。"
                 else:
                     if not customers:
+                        _boss_last_search_customers.pop(user_id, None)
                         reply_text = f"找不到名稱含有「{keyword}」的客戶。"
                     else:
+                        _boss_last_search_customers[user_id] = customers
                         lines = [f"🔍 搜尋「{keyword}」，共找到 {len(customers)} 位客戶：\n"]
                         for c in customers:
                             name = c.get('displayName', '未知')
                             lines.append(f"• {name}")
-                        lines.append("\n📋 輸入「客戶訂單 姓名」可查看該客戶的歷史訂單")
+                        lines.append("\n👇 請點選「客戶訂單」即可從清單中選擇客戶查看訂單")
                         reply_text = "\n".join(lines)
             LineService.reply_text(line_bot_api, event.reply_token, reply_text)
             return
@@ -194,19 +208,13 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                     if not orders:
                         reply_text = f"找不到客戶「{customer_name}」的訂單紀錄。"
                     else:
-                        lines = [f"📋 {customer_name} 的最近 {len(orders)} 筆訂單：\n"]
-                        for o in orders:
-                            items_list = o.get('items', [])
-                            items_str = "、".join([
-                                f"{i.get('productName', '')} x{i.get('quantity', 0)}"
-                                for i in items_list
-                            ])
-                            status = "✅已付款" if o.get('paymentStatus') == 'paid' else "❌未付款"
-                            delivered = "🚚已送達" if o.get('deliveryDate') else "📦未送達"
-                            total = o.get('totalAmount', 0)
-                            order_id = o.get('orderId', 'N/A')
-                            lines.append(f"• [{order_id}]\n  {items_str}\n  總額：${total}　{status}　{delivered}")
-                        reply_text = "\n".join(lines)
+                        LineService.reply_flex(
+                            line_bot_api,
+                            event.reply_token,
+                            f"{customer_name} 的訂單紀錄",
+                            _flex_boss_order_history(customer_name, orders),
+                        )
+                        return
             LineService.reply_text(line_bot_api, event.reply_token, reply_text)
             return
 
@@ -257,6 +265,127 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                         lines.append("    付款方式：cash / transfer / check")
                         reply_text = "\n".join(lines)
             LineService.reply_text(line_bot_api, event.reply_token, reply_text)
+            return
+
+        if mode == "boss_help_customer_name":
+            user_input = user_msg.strip()
+            if not user_input:
+                LineService.reply_text(line_bot_api, event.reply_token, "請輸入客戶姓名，例：王小明")
+                return
+
+            # Helper: proceed to product catalogue after customer is resolved.
+            def _proceed_to_catalogue(cust_name: str, cust_id: str) -> None:
+                _boss_pending_data[user_id] = {
+                    "help_flow": True,
+                    "customer_name": cust_name,
+                    "customer_id": cust_id,
+                }
+                try:
+                    products = FirebaseDB.get_products()
+                except Exception as exc:
+                    logger.error(f"Failed to fetch products: {exc}")
+                    LineService.reply_text(line_bot_api, event.reply_token, "查詢商品時發生錯誤，請稍後再試。")
+                    return
+                if not products:
+                    LineService.reply_text(line_bot_api, event.reply_token, "目前暫無上架商品，請稍後再查詢。")
+                    return
+                LineService.reply_flex(line_bot_api, event.reply_token, "商品目錄", _flex_category_picker(products))
+
+            # ── Flex-button tap: restart search (show keyboard again) ────────
+            if user_input == "重新搜尋客戶":
+                _boss_pending_data.pop(user_id, None)
+                try:
+                    line_bot_api.unlink_rich_menu_from_user(user_id)
+                except Exception:
+                    pass
+                _boss_next_input_mode[user_id] = "boss_help_customer_name"
+                LineService.reply_text(line_bot_api, event.reply_token, "請輸入客戶姓名，例：王小明")
+                return
+
+            # ── Flex-button tap: create a new customer ───────────────────────
+            if user_input.startswith("新增客戶 "):
+                new_name = user_input[len("新增客戶 "):].strip()
+                if not new_name:
+                    LineService.reply_text(line_bot_api, event.reply_token, "客戶姓名不能為空，請重新操作。")
+                    return
+                try:
+                    new_customer_id = FirebaseDB.create_customer(new_name)
+                except Exception as e:
+                    logger.error(f"create_customer failed: {e}")
+                    LineService.reply_text(line_bot_api, event.reply_token, "新增客戶時發生錯誤，請稍後再試。")
+                    return
+                _proceed_to_catalogue(new_name, new_customer_id)
+                return
+
+            # ── Flex-button tap: select an existing candidate ────────────────
+            if user_input.startswith("下單給客戶 "):
+                selected_name = user_input[len("下單給客戶 "):].strip()
+                pending = _boss_pending_data.get(user_id, {})
+                candidates = pending.get("candidates", [])
+                matches = [c for c in candidates if c.get("displayName") == selected_name]
+                if not matches:
+                    # Fallback: re-query DB for an exact name match
+                    try:
+                        found = FirebaseDB.search_customers_by_name(selected_name)
+                    except Exception as e:
+                        logger.error(f"Customer lookup failed: {e}")
+                        found = []
+                    matches = [c for c in found if c.get("displayName") == selected_name]
+                if matches:
+                    c = matches[0]
+                    _proceed_to_catalogue(c.get("displayName", selected_name), c.get("userId", ""))
+                else:
+                    LineService.reply_text(
+                        line_bot_api, event.reply_token,
+                        f"找不到客戶「{selected_name}」，請重新搜尋。",
+                    )
+                    _boss_next_input_mode[user_id] = "boss_help_customer_name"
+                return
+
+            # ── Normal text input: fuzzy search ─────────────────────────────
+            try:
+                customers = FirebaseDB.search_customers_by_name(user_input)
+            except Exception as e:
+                logger.error(f"Customer search failed: {e}")
+                LineService.reply_text(line_bot_api, event.reply_token, "查詢客戶時發生錯誤，請稍後再試。")
+                return
+
+            if not customers:
+                # No match — show flex with 重新搜尋 and 新增 buttons.
+                _boss_pending_data[user_id] = {"pending_new_name": user_input}
+                _boss_next_input_mode[user_id] = "boss_help_customer_name"
+                LineService.reply_flex(
+                    line_bot_api, event.reply_token,
+                    f"找不到「{user_input}」的客戶",
+                    _flex_customer_not_found(user_input),
+                )
+                return
+
+            if len(customers) == 1:
+                resolved_customer = customers[0]
+            else:
+                # Multiple results — check for exact match first.
+                exact = [c for c in customers if c.get("displayName", "") == user_input]
+                if len(exact) == 1:
+                    resolved_customer = exact[0]
+                else:
+                    # Ambiguous — show flex picker with all candidates + create-new button.
+                    _boss_pending_data[user_id] = {
+                        "pending_new_name": user_input,
+                        "candidates": customers,
+                    }
+                    _boss_next_input_mode[user_id] = "boss_help_customer_name"
+                    LineService.reply_flex(
+                        line_bot_api, event.reply_token,
+                        f"搜尋「{user_input}」的結果",
+                        _flex_customer_search_candidates(user_input, customers),
+                    )
+                    return
+
+            # Single resolved customer — proceed.
+            resolved_name = resolved_customer.get("displayName", user_input)
+            customer_id = resolved_customer.get("userId", "")
+            _proceed_to_catalogue(resolved_name, customer_id)
             return
 
         elif mode == "boss_help_order":
@@ -349,7 +478,7 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                 idx = int(parts[0])
                 quantity = int(parts[1])
             else:
-                reply_text = "請輸入商品編號與數量，例：3 2，或僅輸入數量，例：2"
+                reply_text = "請輸入數量，例：2"
                 LineService.reply_text(line_bot_api, event.reply_token, reply_text)
                 return
             if quantity <= 0:
@@ -364,7 +493,30 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                     return
                 product = products[idx - 1]
                 unit_price = _product_unit_price(product)
-                # 暫存 product 與 quantity，接下來要求輸入客戶姓名
+                # If customer was already collected in boss_help_customer_name, skip asking again.
+                existing_data = data or _boss_pending_data.get(user_id, {})
+                customer_name_cached = existing_data.get("customer_name")
+                customer_id_cached = existing_data.get("customer_id", "")
+                if customer_name_cached:
+                    _boss_pending_orders[user_id] = {
+                        "product_idx": idx,
+                        "quantity": quantity,
+                        "customer_name": customer_name_cached,
+                        "customer_id": customer_id_cached,
+                        "product": product,
+                    }
+                    _boss_pending_data.pop(user_id, None)
+                    LineService.reply_flex(
+                        line_bot_api,
+                        event.reply_token,
+                        "輸入客戶配送地址",
+                        _flex_boss_address_prompt(
+                            customer_name_cached,
+                            _product_summary_text(product.get("productName", ""), quantity, unit_price),
+                        ),
+                    )
+                    return
+                # Fallback: no customer yet — ask for name
                 _boss_pending_data[user_id] = {
                     "product_idx": idx,
                     "quantity": quantity,
@@ -372,7 +524,7 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                     "help_flow": True,
                 }
                 _boss_next_input_mode[user_id] = "boss_order_customer"
-                reply_text = "請輸入客戶姓名，例：王小明（系統會嘗試模糊搜尋現有客戶）"
+                reply_text = "請輸入客戶姓名，例：王小明"
             except Exception as e:
                 logger.error(f"Failed to fetch products: {e}")
                 reply_text = "查詢商品時發生錯誤，請稍後再試。"
@@ -511,12 +663,17 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
             reply_text = "建立訂單時發生錯誤，請稍後再試。"
 
     elif user_msg == "幫客戶下單":
-        _boss_next_input_mode[user_id] = "boss_help_order"
+        _boss_next_input_mode[user_id] = "boss_help_customer_name"
         _boss_pending_data[user_id] = {}
+        # Unlink rich menu so the keyboard appears automatically.
+        try:
+            line_bot_api.unlink_rich_menu_from_user(user_id)
+        except Exception as _e:
+            logger.warning(f"Could not unlink rich menu for boss {user_id}: {_e}")
         LineService.reply_text(
             line_bot_api,
             event.reply_token,
-            "請輸入 客戶姓名 訂單編號 數量，例如：王小明 3 2，系統會直接建立該客戶的訂單。",
+            "請輸入要下單的客戶姓名，例：王小明",
         )
         return
 
@@ -540,8 +697,19 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
 
         if len(variants) == 1:
             global_idx, product = variants[0]
+            pending = _boss_pending_data.get(user_id, {})
+            if pending.get("help_flow"):
+                _boss_next_input_mode[user_id] = "boss_order_quantity"
+                _boss_pending_data[user_id] = {
+                    "product_idx": global_idx,
+                    "help_flow": True,
+                    "customer_name": pending.get("customer_name"),
+                    "customer_id": pending.get("customer_id", ""),
+                }
             LineService.reply_flex(line_bot_api, event.reply_token,
-                                   f"商品資訊 #{global_idx}", _flex_product_detail(global_idx, product))
+                                   f"商品資訊 #{global_idx}",
+                                   _flex_product_detail(global_idx, product,
+                                                        boss_flow=pending.get("help_flow", False)))
         else:
             LineService.reply_flex(line_bot_api, event.reply_token,
                                    f"{category_name} 規格選擇", _flex_spec_picker(category_name, variants))
@@ -570,9 +738,16 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
         pending = _boss_pending_data.get(user_id, {})
         if pending.get("help_flow"):
             _boss_next_input_mode[user_id] = "boss_order_quantity"
-            _boss_pending_data[user_id] = {"product_idx": idx, "help_flow": True}
+            _boss_pending_data[user_id] = {
+                "product_idx": idx,
+                "help_flow": True,
+                "customer_name": pending.get("customer_name"),
+                "customer_id": pending.get("customer_id", ""),
+            }
         LineService.reply_flex(line_bot_api, event.reply_token,
-                               f"商品資訊 #{idx}", _flex_product_detail(idx, products[idx - 1]))
+                               f"商品資訊 #{idx}",
+                               _flex_product_detail(idx, products[idx - 1],
+                                                    boss_flow=pending.get("help_flow", False)))
         return
 
     elif user_msg.startswith("老闆下單"):
@@ -639,7 +814,12 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
         if not keyword:
             _boss_next_input_mode[user_id] = "customer_search"
             _boss_pending_data[user_id] = {}
-            reply_text = "請搜尋關鍵字，例：王"
+            # Unlink the rich menu so the keyboard appears automatically.
+            try:
+                line_bot_api.unlink_rich_menu_from_user(user_id)
+            except Exception as _e:
+                logger.warning(f"Could not unlink rich menu for boss {user_id}: {_e}")
+            reply_text = "請輸入客戶姓名關鍵字，例：王"
         else:
             try:
                 customers = FirebaseDB.search_customers_by_name(keyword)
@@ -648,22 +828,35 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                 reply_text = "查詢客戶時發生錯誤，請稍後再試。"
             else:
                 if not customers:
+                    _boss_last_search_customers.pop(user_id, None)
                     reply_text = f"找不到名稱含有「{keyword}」的客戶。"
                 else:
+                    _boss_last_search_customers[user_id] = customers
                     lines = [f"🔍 搜尋「{keyword}」，共找到 {len(customers)} 位客戶：\n"]
                     for c in customers:
                         name = c.get('displayName', '未知')
                         lines.append(f"• {name}")
-                    lines.append("\n📋 輸入「客戶訂單 姓名」可查看該客戶的歷史訂單")
+                    lines.append("\n👇 請點選「客戶訂單」即可從清單中選擇客戶查看訂單")
                     reply_text = "\n".join(lines)
 
     # ── 客戶訂單 <姓名> ───────────────────────────────────────────────
     elif user_msg.startswith("客戶訂單"):
         customer_name = user_msg[4:].strip()
         if not customer_name:
-            _boss_next_input_mode[user_id] = "customer_order_name"
-            _boss_pending_data[user_id] = {}
-            reply_text = "請輸入客戶姓名，例：王小明"
+            last_customers = _boss_last_search_customers.get(user_id, [])
+            if not last_customers:
+                reply_text = (
+                    "⚠️ 請先點選「查詢客戶」並輸入關鍵字搜尋客戶，\n"
+                    "搜尋完成後再點選「客戶訂單」即可從清單中選擇。"
+                )
+            else:
+                LineService.reply_flex(
+                    line_bot_api,
+                    event.reply_token,
+                    "選擇客戶",
+                    _flex_boss_customer_picker(last_customers),
+                )
+                return
         else:
             try:
                 orders = FirebaseDB.get_orders_by_customer_name(customer_name)
@@ -674,19 +867,13 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                 if not orders:
                     reply_text = f"找不到客戶「{customer_name}」的訂單紀錄。"
                 else:
-                    lines = [f"📋 {customer_name} 的最近 {len(orders)} 筆訂單：\n"]
-                    for o in orders:
-                        items_list = o.get('items', [])
-                        items_str = "、".join([
-                            f"{i.get('productName', '')} x{i.get('quantity', 0)}"
-                            for i in items_list
-                        ])
-                        status = "✅已付款" if o.get('paymentStatus') == 'paid' else "❌未付款"
-                        delivered = "🚚已送達" if o.get('deliveryDate') else "📦未送達"
-                        total = o.get('totalAmount', 0)
-                        order_id = o.get('orderId', 'N/A')
-                        lines.append(f"• [{order_id}]\n  {items_str}\n  總額：${total}　{status}　{delivered}")
-                    reply_text = "\n".join(lines)
+                    LineService.reply_flex(
+                        line_bot_api,
+                        event.reply_token,
+                        f"{customer_name} 的訂單紀錄",
+                        _flex_boss_order_history(customer_name, orders),
+                    )
+                    return
 
     # ── 未付款清單 <時間範圍> ─────────────────────────────────────────
     elif user_msg.startswith("未付款清單"):
@@ -1323,10 +1510,10 @@ def _flex_spec_picker(category_name: str, variants: list):
     )
 
 
-def _flex_product_detail(global_idx: int, product: dict):
+def _flex_product_detail(global_idx: int, product: dict, boss_flow: bool = False):
     """
     Step 3: Product detail card — name, spec, price, index, and order instruction.
-    Instruction text uses no emoji per spec.
+    boss_flow=True shows a quantity-input prompt instead of the customer order syntax.
     """
     name = product.get('productName', '')
     spec = product.get('spec', '')
@@ -1384,13 +1571,21 @@ def _flex_product_detail(global_idx: int, product: dict):
             background_color='#F5F5F5',
             padding_all='lg',
             spacing='xs',
-            contents=[
-                TextComponent(text='下單方式', size='sm', weight='bold', color='#555555'),
-                TextComponent(text=f'下單 {global_idx} 數量',
-                              size='sm', color='#333333', margin='sm'),
-                TextComponent(text=f'例: 下單 {global_idx} 2',
-                              size='xs', color='#AAAAAA'),
-            ],
+            contents=(
+                [
+                    TextComponent(text='商品已選定', size='sm', weight='bold', color='#555555'),
+                    TextComponent(text='請直接輸入購買數量，例：2',
+                                  size='sm', color='#333333', margin='sm'),
+                ]
+                if boss_flow else
+                [
+                    TextComponent(text='下單方式', size='sm', weight='bold', color='#555555'),
+                    TextComponent(text=f'下單 {global_idx} 數量',
+                                  size='sm', color='#333333', margin='sm'),
+                    TextComponent(text=f'例: 下單 {global_idx} 2',
+                                  size='xs', color='#AAAAAA'),
+                ]
+            ),
         ),
     )
 
@@ -1429,6 +1624,262 @@ def _flex_customer_address_prompt(items_summary: str):
             ],
         ),
     )
+
+
+def _flex_customer_not_found(keyword: str):
+    """Flex bubble shown when no customer matches the search keyword."""
+    return BubbleContainer(
+        size='kilo',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#F5A623',
+            padding_all='md',
+            contents=[
+                TextComponent(text='🔍 找不到客戶', color='#FFFFFF', weight='bold', size='lg'),
+                TextComponent(
+                    text=f'找不到「{keyword}」',
+                    color='#FFF3CD',
+                    size='sm',
+                    wrap=True,
+                    margin='xs',
+                ),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='md',
+            contents=[
+                TextComponent(text='請選擇以下操作：', size='sm', color='#888888', wrap=True),
+            ],
+        ),
+        footer=BoxComponent(
+            layout='vertical',
+            spacing='sm',
+            contents=[
+                ButtonComponent(
+                    style='secondary',
+                    height='sm',
+                    action=MessageAction(label='重新輸入關鍵字', text='重新搜尋客戶'),
+                ),
+                ButtonComponent(
+                    style='primary',
+                    height='sm',
+                    color='#2C7A4B',
+                    action=MessageAction(
+                        label=f'新增「{keyword}」為客戶',
+                        text=f'新增客戶 {keyword}',
+                    ),
+                ),
+            ],
+        ),
+    )
+
+
+def _flex_customer_search_candidates(keyword: str, customers: list):
+    """
+    Flex bubble listing ambiguous search results as tappable buttons,
+    plus a "create new" button at the bottom.
+    """
+    customer_buttons = [
+        ButtonComponent(
+            style='secondary',
+            height='sm',
+            margin='xs',
+            action=MessageAction(
+                label=c.get('displayName', '未知客戶')[:20],
+                text=f"下單給客戶 {c.get('displayName', '未知客戶')}",
+            ),
+        )
+        for c in customers[:6]  # cap to keep bubble height reasonable
+    ]
+    return BubbleContainer(
+        size='kilo',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='md',
+            contents=[
+                TextComponent(text='🔍 搜尋結果', color='#FFFFFF', weight='bold', size='lg'),
+                TextComponent(
+                    text=f'找到 {len(customers)} 位符合「{keyword}」的客戶',
+                    color='#CCFFCC',
+                    size='sm',
+                    wrap=True,
+                    margin='xs',
+                ),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='md',
+            contents=[
+                TextComponent(text='點選客戶繼續下單，或新增新客戶', size='sm', color='#888888', wrap=True),
+            ],
+        ),
+        footer=BoxComponent(
+            layout='vertical',
+            spacing='sm',
+            contents=customer_buttons + [
+                SeparatorComponent(margin='md'),
+                ButtonComponent(
+                    style='primary',
+                    height='sm',
+                    color='#2C7A4B',
+                    margin='md',
+                    action=MessageAction(
+                        label=f'新增「{keyword}」為新客戶',
+                        text=f'新增客戶 {keyword}',
+                    ),
+                ),
+            ],
+        ),
+    )
+
+
+def _flex_boss_customer_picker(customers: list):
+    """
+    Shows the customers returned by the last "查詢客戶" search as tappable buttons.
+    Tapping a button sends "客戶訂單 <name>" which triggers the order lookup.
+    """
+    buttons = [
+        ButtonComponent(
+            action=MessageAction(
+                label=c.get('displayName', '未知客戶')[:12],
+                text=f"客戶訂單 {c.get('displayName', '')}",
+            ),
+            style='secondary',
+            height='sm',
+            margin='xs',
+        )
+        for c in customers
+    ]
+
+    return BubbleContainer(
+        size='giga',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text='客戶清單', color='#FFFFFF', weight='bold', size='xl'),
+                TextComponent(text='點選客戶以查看歷史訂單', color='#CCFFCC', size='xs', margin='xs'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            spacing='xs',
+            padding_all='md',
+            contents=buttons,
+        ),
+    )
+
+
+def _flex_boss_order_history(customer_name: str, orders: list):
+    """
+    Shows a customer's order history as a Flex carousel.
+    Uses serial numbers (#1, #2 ...) instead of raw order IDs.
+    LINE carousels are capped at 10 bubbles.
+    """
+    tw_tz = timezone(timedelta(hours=8))
+    bubbles = []
+    for idx, o in enumerate(orders[:10], start=1):
+        items_list = o.get('items', [])
+        payment_status = o.get('paymentStatus', '')
+        if payment_status == 'paid':
+            payment_label = '✅ 已付款'
+            payment_color = '#1DB446'
+        elif payment_status == 'pending_confirmation':
+            payment_label = '🕓 待確認'
+            payment_color = '#FF9500'
+        else:
+            payment_label = '❌ 未付款'
+            payment_color = '#E53935'
+
+        delivered = o.get('deliveryDate')
+        delivery_label = '🚚 已送達' if delivered else '📦 未送達'
+        delivery_color = '#1DB446' if delivered else '#888888'
+
+        order_date = o.get('orderDate')
+        if order_date:
+            try:
+                date_str = order_date.astimezone(tw_tz).strftime('%Y/%m/%d %H:%M')
+            except Exception:
+                date_str = str(order_date)
+        else:
+            date_str = '—'
+
+        body_contents = []
+        for i in items_list:
+            body_contents.append(BoxComponent(
+                layout='horizontal',
+                margin='xs',
+                contents=[
+                    TextComponent(text=i.get('productName', ''), size='sm',
+                                  color='#333333', flex=5, wrap=True),
+                    TextComponent(text=f"x{i.get('quantity', 0)}", size='sm',
+                                  color='#888888', flex=1, align='end'),
+                ],
+            ))
+
+        body_contents += [
+            SeparatorComponent(margin='md', color='#EEEEEE'),
+            BoxComponent(
+                layout='horizontal', margin='md',
+                contents=[
+                    TextComponent(text='總金額', size='sm', color='#888888', flex=2),
+                    TextComponent(text=f"${o.get('totalAmount', 0):,}", size='sm',
+                                  color='#222222', weight='bold', flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='付款', size='sm', color='#888888', flex=2),
+                    TextComponent(text=payment_label, size='sm',
+                                  color=payment_color, weight='bold', flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='配送', size='sm', color='#888888', flex=2),
+                    TextComponent(text=delivery_label, size='sm',
+                                  color=delivery_color, flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='下單時間', size='xs', color='#888888', flex=2),
+                    TextComponent(text=date_str, size='xs', color='#666666',
+                                  flex=3, align='end', wrap=True),
+                ],
+            ),
+        ]
+
+        bubbles.append(BubbleContainer(
+            size='kilo',
+            header=BoxComponent(
+                layout='vertical',
+                background_color='#2C7A4B',
+                padding_all='md',
+                contents=[
+                    TextComponent(text=f'#{idx}', color='#CCFFCC', size='xs'),
+                    TextComponent(text=customer_name, color='#FFFFFF',
+                                  weight='bold', size='md', wrap=True),
+                ],
+            ),
+            body=BoxComponent(
+                layout='vertical',
+                padding_all='lg',
+                spacing='none',
+                contents=body_contents,
+            ),
+        ))
+
+    if len(bubbles) == 1:
+        return bubbles[0]
+    return CarouselContainer(contents=bubbles)
 
 
 def _flex_boss_address_prompt(customer_name: str, items_summary: str):

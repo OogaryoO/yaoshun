@@ -55,16 +55,27 @@ class FirebaseDB:
         """
         身分驗證與路由：透過 LINE UID 查詢使用者。
         若查無資料，預設新建為 "customer" (除非是老闆的 UID)。
+        BOSS_LINE_ID 的比對永遠優先於 Firestore 中存放的 role 值，
+        確保即使資料庫記錄有誤也能正確分流。
         回傳使用者的 role 字串。
         """
+        # 永遠以 BOSS_LINE_ID 為最高優先：只要 UID 符合，無論資料庫內容為何都給 boss
+        is_boss = bool(Config.BOSS_LINE_ID and user_id == Config.BOSS_LINE_ID)
+        role = 'boss' if is_boss else 'customer'
+
         user_ref = db.collection('Users').document(user_id)
         doc = user_ref.get()
 
         if doc.exists:
-            return doc.to_dict().get('role', 'customer')
+            stored_role = doc.to_dict().get('role', 'customer')
+            if is_boss and stored_role != 'boss':
+                # 修正資料庫中錯誤的 role，確保一致性
+                user_ref.update({'role': 'boss'})
+                logger.info(f"Updated user {user_id} role from '{stored_role}' to 'boss'.")
+            elif not is_boss:
+                role = stored_role
         else:
-            # 建立新使用者，若 UID 與設定檔的老闆 UID 相同則賦予 boss 權限
-            role = 'boss' if user_id == Config.BOSS_LINE_ID else 'customer'
+            # 建立新使用者
             payload = UserDoc(
                 role=role,
                 displayName=display_name or "Unknown",
@@ -74,7 +85,8 @@ class FirebaseDB:
             ).to_dict()
             user_ref.set(payload)
             logger.info(f"Created new user with role {role}.")
-            return role
+
+        return role
 
     # ==========================
     # 2. 客戶端功能 (Products / Orders)
@@ -259,6 +271,25 @@ class FirebaseDB:
                 data['userId'] = doc.id
                 results.append(data)
         return results
+
+    @staticmethod
+    def create_customer(display_name: str) -> str:
+        """
+        由老闆手動新增一位客戶，寫入 Firestore Users 集合。
+        回傳新建立的 document ID。
+        """
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        customer_id = f"MANUAL-{now.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+        user = UserDoc(
+            role="customer",
+            displayName=display_name,
+            phone="",
+            notes="",
+            createdAt=firestore.SERVER_TIMESTAMP,
+        )
+        db.collection('Users').document(customer_id).set(user.to_dict())
+        logger.info(f"Manually created customer {customer_id}: {display_name}")
+        return customer_id
 
     @staticmethod
     def notify_payment(order_id: str, user_id: str) -> dict:

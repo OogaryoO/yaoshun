@@ -3,11 +3,12 @@ import logging
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage
+from linebot.models import MessageEvent, TextMessage, FollowEvent
 
 # 匯入環境變數設定與服務模組
 from config import Config
 from services.firebase_db import init_firebase
+from services.line_service import LineService
 from handlers.message_router import handle_text_message
 
 # 設定基本的日誌紀錄，方便在 Render 上 debug
@@ -54,6 +55,26 @@ def handle_message(event):
         handle_text_message(event, line_bot_api)
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
+
+# 5. 加入好友事件：立即根據 LINE ID 綁定正確的 Rich Menu
+@handler.add(FollowEvent)
+def handle_follow(event):
+    """
+    使用者加入好友（或解除封鎖後重新加入）時觸發。
+    依照 BOSS_LINE_ID 判斷角色，立即綁定對應的 Rich Menu，
+    無需等到使用者傳送第一則訊息才切換選單。
+    """
+    user_id = event.source.user_id
+    try:
+        role = 'boss' if Config.BOSS_LINE_ID and user_id == Config.BOSS_LINE_ID else 'customer'
+        LineService.bind_rich_menu_to_user(
+            line_bot_api,
+            user_id,
+            Config.BOSS_RICH_MENU_ID if role == 'boss' else Config.CUSTOMER_RICH_MENU_ID,
+        )
+        logger.info(f"FollowEvent: bound '{role}' rich menu to user {user_id}.")
+    except Exception as e:
+        logger.error(f"Error handling follow event: {e}", exc_info=True)
 
 if __name__ == "__main__":
     # 在 Render 環境中，系統會自動分配 PORT
