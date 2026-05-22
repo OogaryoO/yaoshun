@@ -31,6 +31,12 @@ _boss_pending_data: dict[str, dict] = {}
 # Stores the last list of customers returned by "查詢客戶" for each boss.
 # Used by "客戶訂單" to display a flex customer picker.
 _boss_last_search_customers: dict[str, list] = {}
+# Stores the last list of unpaid orders returned by "未付款清單" for each boss.
+# Used by "確認付款" to display an interactive payment confirmation picker.
+_boss_last_unpaid_orders: dict[str, list] = {}
+# Stores the last list of undelivered orders returned by "送達" for each boss.
+# Used by "送達選擇" to identify which order to mark delivered.
+_boss_last_undelivered_orders: dict[str, list] = {}
 # Prefix used when the boss creates an order for a customer not yet mapped to a LINE user ID.
 _MANUAL_CUSTOMER_PREFIX = "MANUAL_"
 
@@ -54,7 +60,9 @@ _BOSS_COMMAND_PREFIXES = (
     "查詢客戶",
     "客戶訂單",
     "未付款清單",
+    "確認付款選擇",
     "確認付款",
+    "送達選擇",
     "送達",
 )
 
@@ -879,22 +887,24 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
     elif user_msg.startswith("未付款清單"):
         range_keyword = user_msg[5:].strip()
         if not range_keyword:
-            _boss_next_input_mode[user_id] = "unpaid_range"
-            _boss_pending_data[user_id] = {}
-            reply_text = "請輸入時間範圍，例：本週"
+            # Show time range picker flex card
+            LineService.reply_flex(
+                line_bot_api, event.reply_token,
+                "選擇查詢時間範圍",
+                _flex_boss_unpaid_range_picker(),
+            )
+            return
         else:
             now = datetime.now(timezone.utc)
-
             RANGE_MAP = {
-                "本週":   (now - timedelta(weeks=1),  "本週"),
-                "本月":   (now - timedelta(days=30),  "本月（近30天）"),
+                "本週":     (now - timedelta(weeks=1),  "本週"),
+                "本月":     (now - timedelta(days=30),  "本月（近30天）"),
                 "近兩個月": (now - timedelta(days=60),  "近兩個月"),
                 "近三個月": (now - timedelta(days=90),  "近三個月"),
             }
-
             if range_keyword not in RANGE_MAP:
                 reply_text = (
-                    f"不認識的時間範圍「{range_keyword}」，請輸入：\n"
+                    f"不認識的時間範圍「{range_keyword}」，請點選按鈕選擇：\n"
                     "本週 / 本月 / 近兩個月 / 近三個月"
                 )
             else:
@@ -906,41 +916,87 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
                     reply_text = "查詢未付款清單時發生錯誤，請稍後再試。"
                 else:
                     if not orders:
+                        _boss_last_unpaid_orders.pop(user_id, None)
                         reply_text = f"老闆好，{label}內沒有任何未付款的訂單！"
                     else:
-                        total_debt = sum(o.get('totalAmount', 0) for o in orders)
-                        lines = [f"💰 {label}未付款訂單，共 {len(orders)} 筆（合計 ${total_debt}）：\n"]
-                        for o in orders:
-                            customer = o.get('customerName', '未知客戶')
-                            items_list = o.get('items', [])
-                            items_str = "、".join([
-                                f"{i.get('productName', '')} x{i.get('quantity', 0)}"
-                                for i in items_list
-                            ])
-                            total = o.get('totalAmount', 0)
-                            order_id = o.get('orderId', 'N/A')
-                            # 待確認的訂單以「🕓 待確認」標示，未付款則用一般 bullet
-                            if o.get('paymentStatus') == 'pending_confirmation':
-                                prefix = "🕓 待確認"
-                            else:
-                                prefix = "•"
-                            lines.append(f"{prefix} {customer}｜{items_str}｜${total}\n  訂單編號：{order_id}")
-                        lines.append("\n💡 客戶已回報但尚未確認的訂單：輸入「確認付款 訂單編號 付款方式」即可入帳。")
-                        lines.append("    付款方式：cash / transfer / check")
-                        reply_text = "\n".join(lines)
+                        orders.sort(key=lambda o: (o.get('orderDate') is None, o.get('orderDate')))
+                        _boss_last_unpaid_orders[user_id] = orders
+                        LineService.reply_flex(
+                            line_bot_api, event.reply_token,
+                            f"{label}未付款清單",
+                            _flex_boss_unpaid_orders(label, orders),
+                        )
+                        return
+
+    # ── 確認付款選擇 <序號> <付款方式> ─────────────────────────────────
+    elif user_msg.startswith("確認付款選擇"):
+        rest = user_msg[len("確認付款選擇"):].strip()
+        parts = rest.split()
+        if len(parts) != 2:
+            reply_text = "格式不正確，請直接點選付款按鈕。"
+        else:
+            serial_str, method = parts
+            try:
+                serial = int(serial_str)
+            except ValueError:
+                serial = None
+            last_orders = _boss_last_unpaid_orders.get(user_id, [])
+            if serial is None or serial < 1 or serial > len(last_orders):
+                reply_text = f"序號 {serial_str} 不存在，請重新點選「未付款清單」查詢。"
+            else:
+                o = last_orders[serial - 1]
+                order_id = o.get('orderId', '')
+                try:
+                    FirebaseDB.confirm_payment(order_id, method)
+                    customer_name = o.get('customerName', '未知客戶')
+                    total = o.get('totalAmount', 0)
+                    METHOD_LABELS = {'cash': '現金', 'transfer': '轉帳', 'check': '支票'}
+                    method_label = METHOD_LABELS.get(method, method)
+                    reply_text = (
+                        f"✅ 已確認付款並入帳。\n"
+                        f"序號：#{serial}\n"
+                        f"客戶：{customer_name}\n"
+                        f"金額：${total:,}\n"
+                        f"付款方式：{method_label}"
+                    )
+                    # Remove the confirmed order from cache to prevent double confirmation
+                    _boss_last_unpaid_orders[user_id] = [
+                        ord_item for i, ord_item in enumerate(last_orders, start=1)
+                        if i != serial
+                    ]
+                except ValueError as e:
+                    msg = str(e)
+                    if msg == "already_paid":
+                        reply_text = f"第 #{serial} 筆訂單已是已付款狀態，無需再次確認。"
+                    elif msg == "invalid_method":
+                        reply_text = "付款方式不合法，請直接點選按鈕選擇。"
+                    else:
+                        reply_text = "找不到對應訂單，請重新點選「未付款清單」查詢。"
+                except Exception as e:
+                    logger.error(f"confirm_payment_selected failed: {e}")
+                    reply_text = "確認付款時發生錯誤，請稍後再試。"
 
     # ── 確認付款 <訂單編號> <付款方式> ─────────────────────────────────
     elif user_msg.startswith("確認付款"):
         rest = user_msg[4:].strip()
         parts = rest.split()
-        if len(parts) != 2:
-            _boss_next_input_mode[user_id] = "confirm_payment"
-            _boss_pending_data[user_id] = {}
-            reply_text = (
-                "請輸入訂單編號與付款方式，例：\n"
-                "ORD-20260514-101530-a1b2 cash"
-            )
-        else:
+        if not rest:
+            # No args — show flex order picker or remind boss to run 未付款清單 first
+            last_orders = _boss_last_unpaid_orders.get(user_id, [])
+            if not last_orders:
+                reply_text = (
+                    "⚠️ 請先點選「未付款清單」並選擇時間範圍，\n"
+                    "查詢到未付款訂單後再點選「確認付款」即可對帳入帳。"
+                )
+            else:
+                LineService.reply_flex(
+                    line_bot_api, event.reply_token,
+                    "選擇要確認付款的訂單",
+                    _flex_boss_confirm_payment_picker(last_orders),
+                )
+                return
+        elif len(parts) == 2:
+            # Legacy / push-notification path: 確認付款 <order_id> <method>
             order_id, method = parts
             try:
                 FirebaseDB.confirm_payment(order_id, method)
@@ -960,23 +1016,67 @@ def _handle_boss_message(event: MessageEvent, line_bot_api: LineBotApi, user_msg
             except Exception as e:
                 logger.error(f"confirm_payment failed: {e}")
                 reply_text = "確認付款時發生錯誤，請稍後再試。"
-
-    # ── 送達 <訂單編號> ────────────────────────────────────────────────
-    # 由老闆直接於 LINE Bot 標記訂單為已送達。
-    # 這是唯一會寫入 deliveryDate 的入口。
-    elif user_msg.startswith("送達"):
-        order_id = user_msg[2:].strip()
-        if not order_id:
-            _boss_next_input_mode[user_id] = "mark_delivered"
-            _boss_pending_data[user_id] = {}
-            reply_text = "請輸入訂單編號，例：ORD-20260514-101530-a1b2"
         else:
+            reply_text = (
+                "格式不正確。\n"
+                "請直接點選「未付款清單」查詢後再點「確認付款」，\n"
+                "或輸入：確認付款 訂單編號 付款方式"
+            )
+
+    # ── 送達選擇 <序號> ────────────────────────────────────────────────
+    elif user_msg.startswith("送達選擇"):
+        serial_str = user_msg[len("送達選擇"):].strip()
+        try:
+            serial = int(serial_str)
+        except ValueError:
+            serial = None
+        last_orders = _boss_last_undelivered_orders.get(user_id, [])
+        if serial is None or serial < 1 or serial > len(last_orders):
+            reply_text = f"序號 {serial_str} 不存在，請重新點選「送達」查詢。"
+        else:
+            o = last_orders[serial - 1]
+            order_id = o.get('orderId', '')
             try:
                 FirebaseDB.mark_delivered(order_id, user_id)
-                reply_text = f"✅ 已標記訂單 {order_id} 為已送達。"
+                customer_name = o.get('customerName', '未知客戶')
+                total = o.get('totalAmount', 0)
+                reply_text = (
+                    f"✅ 已標記送達。\n"
+                    f"序號：#{serial}\n"
+                    f"客戶：{customer_name}\n"
+                    f"金額：${total:,}"
+                )
+                # Remove the delivered order from cache
+                _boss_last_undelivered_orders[user_id] = [
+                    ord_item for i, ord_item in enumerate(last_orders, start=1)
+                    if i != serial
+                ]
             except Exception as e:
-                logger.error(f"mark_delivered failed: {e}")
+                logger.error(f"mark_delivered_selected failed: {e}")
                 reply_text = "標記送達時發生錯誤，請稍後再試。"
+
+    # ── 送達 ────────────────────────────────────────────────────────────
+    # 由老闆直接於 LINE Bot 標記訂單為已送達。這是唯一會寫入 deliveryDate 的入口。
+    elif user_msg.startswith("送達"):
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=90)
+        try:
+            orders = FirebaseDB.get_undelivered_orders(since=since)
+        except Exception as e:
+            logger.error(f"Failed to fetch undelivered orders: {e}")
+            LineService.reply_text(line_bot_api, event.reply_token, "查詢訂單時發生錯誤，請稍後再試。")
+            return
+        if not orders:
+            reply_text = "老闆好，目前沒有尚未送達的訂單！"
+        else:
+            orders.sort(key=lambda o: (o.get('orderDate') is None, o.get('orderDate')))
+            _boss_last_undelivered_orders[user_id] = orders
+            LineService.reply_flex(
+                line_bot_api, event.reply_token,
+                "尚未送達訂單",
+                _flex_boss_undelivered_orders(orders),
+            )
+            return
 
     # ── 預設提示 ──────────────────────────────────────────────────────
     else:
@@ -2018,3 +2118,393 @@ def _flex_contact_boss_card(boss_id: str):
             ],
         ),
     )
+
+
+def _flex_boss_unpaid_range_picker():
+    """Shows 4 time-range buttons for boss to select when querying unpaid orders."""
+    RANGES = ["本週", "本月", "近兩個月", "近三個月"]
+    buttons = [
+        ButtonComponent(
+            action=MessageAction(label=r, text=f"未付款清單 {r}"),
+            style='secondary',
+            height='sm',
+            margin='xs',
+        )
+        for r in RANGES
+    ]
+    return BubbleContainer(
+        size='giga',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text='💰 未付款清單', color='#FFFFFF', weight='bold', size='xl'),
+                TextComponent(text='請選擇查詢的時間範圍', color='#CCFFCC', size='sm', margin='xs'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            spacing='xs',
+            padding_all='md',
+            contents=buttons,
+        ),
+    )
+
+
+def _flex_boss_unpaid_orders(label: str, orders: list):
+    """
+    Carousel of unpaid order info cards with serial numbers (#1, #2 ...).
+    A summary bubble is prepended showing total count and total debt.
+    """
+    tw_tz = timezone(timedelta(hours=8))
+    total_debt = sum(o.get('totalAmount', 0) for o in orders)
+
+    # Summary bubble
+    summary_bubble = BubbleContainer(
+        size='kilo',
+        header=BoxComponent(
+            layout='vertical',
+            background_color='#2C7A4B',
+            padding_all='lg',
+            contents=[
+                TextComponent(text='💰 未付款清單', color='#FFFFFF', weight='bold', size='xl'),
+                TextComponent(text=label, color='#CCFFCC', size='sm', margin='xs'),
+            ],
+        ),
+        body=BoxComponent(
+            layout='vertical',
+            padding_all='lg',
+            contents=[
+                BoxComponent(
+                    layout='horizontal',
+                    contents=[
+                        TextComponent(text='總筆數', size='sm', color='#888888', flex=2),
+                        TextComponent(text=f'{len(orders)} 筆', size='sm',
+                                      color='#222222', weight='bold', flex=3),
+                    ],
+                ),
+                BoxComponent(
+                    layout='horizontal',
+                    margin='sm',
+                    contents=[
+                        TextComponent(text='合計欠款', size='sm', color='#888888', flex=2),
+                        TextComponent(text=f'${total_debt:,}', size='sm',
+                                      color='#E53935', weight='bold', flex=3),
+                    ],
+                ),
+                SeparatorComponent(margin='md', color='#EEEEEE'),
+                TextComponent(
+                    text='點選「確認付款」可對帳入帳',
+                    size='xs',
+                    color='#888888',
+                    margin='md',
+                    wrap=True,
+                ),
+            ],
+        ),
+    )
+
+    order_bubbles = []
+    for idx, o in enumerate(orders[:10], start=1):
+        items_list = o.get('items', [])
+        payment_status = o.get('paymentStatus', '')
+        if payment_status == 'pending_confirmation':
+            status_label = '🕓 待確認'
+            status_color = '#FF9500'
+        else:
+            status_label = '❌ 未付款'
+            status_color = '#E53935'
+
+        order_date = o.get('orderDate')
+        if order_date:
+            try:
+                date_str = order_date.astimezone(tw_tz).strftime('%m/%d %H:%M')
+            except Exception:
+                date_str = str(order_date)
+        else:
+            date_str = '—'
+
+        body_contents = []
+        for item in items_list:
+            body_contents.append(BoxComponent(
+                layout='horizontal',
+                margin='xs',
+                contents=[
+                    TextComponent(text=item.get('productName', ''), size='sm',
+                                  color='#333333', flex=5, wrap=True),
+                    TextComponent(text=f"x{item.get('quantity', 0)}", size='sm',
+                                  color='#888888', flex=1, align='end'),
+                ],
+            ))
+        body_contents += [
+            SeparatorComponent(margin='md', color='#EEEEEE'),
+            BoxComponent(
+                layout='horizontal', margin='md',
+                contents=[
+                    TextComponent(text='總金額', size='sm', color='#888888', flex=2),
+                    TextComponent(text=f"${o.get('totalAmount', 0):,}", size='sm',
+                                  color='#222222', weight='bold', flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='狀態', size='sm', color='#888888', flex=2),
+                    TextComponent(text=status_label, size='sm',
+                                  color=status_color, weight='bold', flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='下單時間', size='xs', color='#888888', flex=2),
+                    TextComponent(text=date_str, size='xs', color='#666666',
+                                  flex=3, align='end'),
+                ],
+            ),
+        ]
+
+        order_bubbles.append(BubbleContainer(
+            size='kilo',
+            header=BoxComponent(
+                layout='vertical',
+                background_color='#2C7A4B',
+                padding_all='md',
+                contents=[
+                    TextComponent(text=f'#{idx}', color='#CCFFCC', size='xs'),
+                    TextComponent(text=o.get('customerName', '未知客戶'), color='#FFFFFF',
+                                  weight='bold', size='md', wrap=True),
+                ],
+            ),
+            body=BoxComponent(
+                layout='vertical',
+                padding_all='lg',
+                spacing='none',
+                contents=body_contents,
+            ),
+        ))
+
+    all_bubbles = [summary_bubble] + order_bubbles
+    if len(all_bubbles) == 1:
+        return all_bubbles[0]
+    return CarouselContainer(contents=all_bubbles)
+
+
+def _flex_boss_confirm_payment_picker(orders: list):
+    """
+    Carousel of unpaid order bubbles; each has 3 payment-method buttons.
+    Tapping sends "確認付款選擇 <serial> <method>".
+    """
+    METHOD_LABELS = [
+        ('cash',     '現金付款'),
+        ('transfer', '轉帳付款'),
+        ('check',    '支票付款'),
+    ]
+    tw_tz = timezone(timedelta(hours=8))
+    bubbles = []
+    for idx, o in enumerate(orders[:10], start=1):
+        items_list = o.get('items', [])
+        payment_status = o.get('paymentStatus', '')
+        if payment_status == 'pending_confirmation':
+            status_label = '🕓 待確認（客戶已回報）'
+            status_color = '#FF9500'
+        else:
+            status_label = '❌ 未付款'
+            status_color = '#E53935'
+
+        order_date = o.get('orderDate')
+        if order_date:
+            try:
+                date_str = order_date.astimezone(tw_tz).strftime('%m/%d %H:%M')
+            except Exception:
+                date_str = str(order_date)
+        else:
+            date_str = '—'
+
+        body_contents = []
+        for item in items_list:
+            body_contents.append(BoxComponent(
+                layout='horizontal',
+                margin='xs',
+                contents=[
+                    TextComponent(text=item.get('productName', ''), size='sm',
+                                  color='#333333', flex=5, wrap=True),
+                    TextComponent(text=f"x{item.get('quantity', 0)}", size='sm',
+                                  color='#888888', flex=1, align='end'),
+                ],
+            ))
+        body_contents += [
+            SeparatorComponent(margin='md', color='#EEEEEE'),
+            BoxComponent(
+                layout='horizontal', margin='md',
+                contents=[
+                    TextComponent(text='總金額', size='sm', color='#888888', flex=2),
+                    TextComponent(text=f"${o.get('totalAmount', 0):,}", size='sm',
+                                  color='#222222', weight='bold', flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='狀態', size='sm', color='#888888', flex=2),
+                    TextComponent(text=status_label, size='sm',
+                                  color=status_color, flex=3, align='end', wrap=True),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='下單時間', size='xs', color='#888888', flex=2),
+                    TextComponent(text=date_str, size='xs', color='#666666',
+                                  flex=3, align='end'),
+                ],
+            ),
+        ]
+
+        footer_buttons = [
+            ButtonComponent(
+                style='primary',
+                height='sm',
+                color='#1DB446',
+                margin='xs',
+                action=MessageAction(label=label, text=f'確認付款選擇 {idx} {method}'),
+            )
+            for method, label in METHOD_LABELS
+        ]
+
+        bubbles.append(BubbleContainer(
+            size='kilo',
+            header=BoxComponent(
+                layout='vertical',
+                background_color='#2C7A4B',
+                padding_all='md',
+                contents=[
+                    TextComponent(text=f'#{idx}', color='#CCFFCC', size='xs'),
+                    TextComponent(text=o.get('customerName', '未知客戶'), color='#FFFFFF',
+                                  weight='bold', size='md', wrap=True),
+                ],
+            ),
+            body=BoxComponent(
+                layout='vertical',
+                padding_all='lg',
+                spacing='none',
+                contents=body_contents,
+            ),
+            footer=BoxComponent(
+                layout='vertical',
+                spacing='sm',
+                padding_all='md',
+                contents=footer_buttons,
+            ),
+        ))
+
+    if len(bubbles) == 1:
+        return bubbles[0]
+    return CarouselContainer(contents=bubbles)
+
+
+def _flex_boss_undelivered_orders(orders: list):
+    """
+    Carousel of undelivered order bubbles; each has a 標記送達 button.
+    Tapping sends "送達選擇 <serial>".
+    """
+    tw_tz = timezone(timedelta(hours=8))
+    bubbles = []
+    for idx, o in enumerate(orders[:10], start=1):
+        items_list = o.get('items', [])
+        payment_status = o.get('paymentStatus', '')
+        if payment_status == 'paid':
+            pay_label = '✅ 已付款'
+            pay_color = '#1DB446'
+        elif payment_status == 'pending_confirmation':
+            pay_label = '🕓 待確認'
+            pay_color = '#FF9500'
+        else:
+            pay_label = '❌ 未付款'
+            pay_color = '#E53935'
+
+        order_date = o.get('orderDate')
+        if order_date:
+            try:
+                date_str = order_date.astimezone(tw_tz).strftime('%m/%d %H:%M')
+            except Exception:
+                date_str = str(order_date)
+        else:
+            date_str = '—'
+
+        body_contents = []
+        for item in items_list:
+            body_contents.append(BoxComponent(
+                layout='horizontal',
+                margin='xs',
+                contents=[
+                    TextComponent(text=item.get('productName', ''), size='sm',
+                                  color='#333333', flex=5, wrap=True),
+                    TextComponent(text=f"x{item.get('quantity', 0)}", size='sm',
+                                  color='#888888', flex=1, align='end'),
+                ],
+            ))
+        body_contents += [
+            SeparatorComponent(margin='md', color='#EEEEEE'),
+            BoxComponent(
+                layout='horizontal', margin='md',
+                contents=[
+                    TextComponent(text='總金額', size='sm', color='#888888', flex=2),
+                    TextComponent(text=f"${o.get('totalAmount', 0):,}", size='sm',
+                                  color='#222222', weight='bold', flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='付款', size='sm', color='#888888', flex=2),
+                    TextComponent(text=pay_label, size='sm',
+                                  color=pay_color, flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='下單時間', size='xs', color='#888888', flex=2),
+                    TextComponent(text=date_str, size='xs', color='#666666',
+                                  flex=3, align='end'),
+                ],
+            ),
+        ]
+
+        bubbles.append(BubbleContainer(
+            size='kilo',
+            header=BoxComponent(
+                layout='vertical',
+                background_color='#2C7A4B',
+                padding_all='md',
+                contents=[
+                    TextComponent(text=f'#{idx}', color='#CCFFCC', size='xs'),
+                    TextComponent(text=o.get('customerName', '未知客戶'), color='#FFFFFF',
+                                  weight='bold', size='md', wrap=True),
+                ],
+            ),
+            body=BoxComponent(
+                layout='vertical',
+                padding_all='lg',
+                spacing='none',
+                contents=body_contents,
+            ),
+            footer=BoxComponent(
+                layout='vertical',
+                padding_all='md',
+                contents=[
+                    ButtonComponent(
+                        style='primary',
+                        height='sm',
+                        color='#2C7A4B',
+                        action=MessageAction(label='🚚 標記送達', text=f'送達選擇 {idx}'),
+                    ),
+                ],
+            ),
+        ))
+
+    if len(bubbles) == 1:
+        return bubbles[0]
+    return CarouselContainer(contents=bubbles)

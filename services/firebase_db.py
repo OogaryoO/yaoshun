@@ -376,3 +376,27 @@ class FirebaseDB:
             data['orderId'] = doc.id
             results.append(data)
         return results
+
+    @staticmethod
+    def get_undelivered_orders(since: datetime = None) -> list:
+        """
+        查詢尚未送達的訂單（deliveryDate == None）。
+        可選填 since 以在 Python 端篩選最早下單時間，避免複合索引需求。
+        """
+        query = db.collection('Orders').where('deliveryDate', '==', None)
+        results = []
+        for doc in query.stream():
+            data = doc.to_dict()
+            data['orderId'] = doc.id
+            if since is not None:
+                order_date = data.get('orderDate')
+                if order_date is not None:
+                    try:
+                        if order_date.tzinfo is None:
+                            order_date = order_date.replace(tzinfo=timezone.utc)
+                        if order_date < since:
+                            continue
+                    except Exception:
+                        pass
+            results.append(data)
+        return results
