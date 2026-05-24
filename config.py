@@ -17,8 +17,11 @@ class Config:
     # 老闆作帳用的 Google 試算表 ID
     GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
 
-    # 老闆的 LINE UID (初期測試與權限判斷用)
+    # 老闆的 LINE UID (推播訊息用)
     BOSS_LINE_ID = os.environ.get('BOSS_LINE_ID')
+
+    # 老闆的 LINE 短帳號（顯示於聯絡按鈕深度連結，格式如 notjerry），與 UID 不同
+    BOSS_LINE_SHORT_ID = os.environ.get('BOSS_LINE_SHORT_ID')
 
     # 改用 Messaging API 建立的 Rich Menu ID，按角色綁定
     CUSTOMER_RICH_MENU_ID = os.environ.get('CUSTOMER_RICH_MENU_ID')

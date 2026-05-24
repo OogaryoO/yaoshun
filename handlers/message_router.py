@@ -80,7 +80,6 @@ def _product_unit_price(product: dict) -> int:
 
 
 def _build_customer_order_success_text(
-    order_id: str,
     product_name: str,
     spec: str,
     quantity: int,
@@ -90,14 +89,13 @@ def _build_customer_order_success_text(
     total = unit_price * quantity
     spec_line = f"\n尺寸：{spec}" if spec else ""
     return (
-        f"✅ 下單成功！\n"
-        f"訂單編號：{order_id}\n"
+        f"下單成功！\n"
         f"品項：{product_name} x {quantity}{spec_line}\n"
         f"單價：${unit_price:,}\n"
         f"總金額：${total:,}\n"
         f"付款狀態：未付款\n"
         f"配送狀態：尚未送達\n"
-        f"🏠 配送地址：{address}\n\n"
+        f"配送地址：{address}\n\n"
         f"如有疑問請輸入「直接聯絡老闆」"
     )
 
@@ -154,7 +152,10 @@ def handle_text_message(event: MessageEvent, line_bot_api: LineBotApi):
             return
 
     # 1.5. 根據角色綁定對應的 Rich Menu
-    LineService.ensure_user_rich_menu(line_bot_api, user_id, role)
+    # 若客戶正在等待鍵盤輸入（如輸入數量、序號），則不重新連結 Rich Menu
+    _keyboard_modes = ("payment_serial", "order_quantity", "simple_order")
+    if _customer_next_input_mode.get(user_id) not in _keyboard_modes:
+        LineService.ensure_user_rich_menu(line_bot_api, user_id, role)
 
     # 2. 根據角色進行主路由分流：boss 走老闆流程，其餘一律視為 customer
     if role == 'boss':
@@ -1108,7 +1109,9 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
         # 若使用者原本在下單或回報付款模式，發送推播通知告知已退出狀態（使用 push 避免占用 reply_token）
         try:
             if previous_mode in ("order_quantity", "simple_order"):
-                LineService.push_text(line_bot_api, user_id, "已退出下單狀態")
+                # Suppress exit notification when user taps a quick-order button (下單 <idx> <num>)
+                if not user_msg.startswith("下單"):
+                    LineService.push_text(line_bot_api, user_id, "已退出下單狀態")
             elif previous_mode == "payment_serial":
                 LineService.push_text(line_bot_api, user_id, "已退出回報付款狀態")
             elif previous_mode is not None:
@@ -1148,6 +1151,10 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                         "quantity": quantity,
                         "product": product,
                     }
+                    try:
+                        line_bot_api.unlink_rich_menu_from_user(user_id)
+                    except Exception as _e:
+                        logger.warning(f"Could not unlink rich menu for {user_id}: {_e}")
                     LineService.reply_flex(
                         line_bot_api,
                         event.reply_token,
@@ -1239,7 +1246,6 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
             )
             _pending_orders.pop(user_id, None)
             reply_text = _build_customer_order_success_text(
-                order_id,
                 product_name,
                 spec,
                 quantity,
@@ -1250,8 +1256,10 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
             logger.error(f"Order creation failed: {e}")
             reply_text = "下單時發生錯誤，請稍後再試或聯絡老闆。"
 
-    # ── 查看商品：Step 1 — 商品類別選擇 ──────────────────────────────────
+    # ── 查看商品：Step 1 — 商品類別選擇（瀏覽模式，不進入下單流程）──────────────
     elif user_msg == "查看商品":
+        # Clear any ordering flow flag so browsing never triggers the order path
+        _customer_pending_data.pop(user_id, None)
         try:
             products = FirebaseDB.get_products()
         except Exception as e:
@@ -1270,6 +1278,7 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
     # ── 商品類別 <品名>：Step 2 — 規格選擇（或直接顯示商品詳情）───────────────
     elif user_msg.startswith("商品類別"):
         category_name = user_msg[4:].strip()
+        ordering_flow = _customer_pending_data.get(user_id, {}).get("ordering_flow", False)
         try:
             products = FirebaseDB.get_products()
         except Exception as e:
@@ -1287,11 +1296,24 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
             return
 
         if len(variants) == 1:
-            # Only one spec — skip spec picker and go straight to product detail
             global_idx, product = variants[0]
-            LineService.reply_flex(line_bot_api, event.reply_token,
-                                   f"商品資訊 #{global_idx}", _flex_product_detail(global_idx, product))
+            if ordering_flow:
+                _customer_next_input_mode[user_id] = "order_quantity"
+                _customer_pending_data[user_id] = {"product_idx": global_idx, "ordering_flow": True}
+                try:
+                    line_bot_api.unlink_rich_menu_from_user(user_id)
+                except Exception as _e:
+                    logger.warning(f"Could not unlink rich menu for {user_id}: {_e}")
+                LineService.reply_flex(line_bot_api, event.reply_token,
+                                       f"商品資訊 #{global_idx}",
+                                       _flex_product_detail(global_idx, product, ordering_flow=True))
+            else:
+                LineService.reply_flex(line_bot_api, event.reply_token,
+                                       f"商品資訊 #{global_idx}", _flex_product_detail(global_idx, product))
         else:
+            # Multiple specs — preserve ordering_flow so the subsequent 商品確認 tap knows the context
+            if ordering_flow:
+                _customer_pending_data[user_id] = {"ordering_flow": True}
             LineService.reply_flex(line_bot_api, event.reply_token,
                                    f"{category_name} 規格選擇", _flex_spec_picker(category_name, variants))
         return
@@ -1316,21 +1338,37 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                                    f"商品編號 {idx} 不存在，請輸入「查看商品」重新選擇。")
             return
 
-        _customer_next_input_mode[user_id] = "order_quantity"
-        _customer_pending_data[user_id] = {"product_idx": idx}
-        LineService.reply_flex(line_bot_api, event.reply_token,
-                               f"商品資訊 #{idx}", _flex_product_detail(idx, products[idx - 1]))
+        ordering_flow = _customer_pending_data.get(user_id, {}).get("ordering_flow", False)
+        if ordering_flow:
+            _customer_next_input_mode[user_id] = "order_quantity"
+            _customer_pending_data[user_id] = {"product_idx": idx, "ordering_flow": True}
+            try:
+                line_bot_api.unlink_rich_menu_from_user(user_id)
+            except Exception as _e:
+                logger.warning(f"Could not unlink rich menu for {user_id}: {_e}")
+            LineService.reply_flex(line_bot_api, event.reply_token,
+                                   f"商品資訊 #{idx}",
+                                   _flex_product_detail(idx, products[idx - 1], ordering_flow=True))
+        else:
+            # Browse-only: just show product info, no ordering UI
+            LineService.reply_flex(line_bot_api, event.reply_token,
+                                   f"商品資訊 #{idx}", _flex_product_detail(idx, products[idx - 1]))
         return
 
-    # ── 我要下單：直接輸入 訂單編號 數量 ─────────────────────────────────────
+    # ── 我要下單：進入下單流程，顯示商品目錄供選擇 ─────────────────────────────
     elif user_msg == "我要下單":
-        _customer_next_input_mode[user_id] = "simple_order"
-        _customer_pending_data[user_id] = {}
-        LineService.reply_text(
-            line_bot_api,
-            event.reply_token,
-            "請輸入 訂單編號 數量，例如：3 2（先輸入「查看商品」取得正確商品編號）",
-        )
+        # Mark ordering flow so subsequent 商品類別/商品確認 taps activate the order path
+        _customer_pending_data[user_id] = {"ordering_flow": True}
+        try:
+            products = FirebaseDB.get_products()
+        except Exception as e:
+            logger.error(f"Failed to fetch products: {e}")
+            LineService.reply_text(line_bot_api, event.reply_token, "查詢商品時發生錯誤，請稍後再試。")
+            return
+        if not products:
+            LineService.reply_text(line_bot_api, event.reply_token, "目前暫無上架商品，請稍後再查詢。")
+            return
+        LineService.reply_flex(line_bot_api, event.reply_token, "商品目錄", _flex_category_picker(products))
         return
 
     # ── 下單 <編號> <數量> ────────────────────────────────────────────
@@ -1362,6 +1400,10 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
                             "quantity": quantity,
                             "product": product,
                         }
+                        try:
+                            line_bot_api.unlink_rich_menu_from_user(user_id)
+                        except Exception as _e:
+                            logger.warning(f"Could not unlink rich menu for {user_id}: {_e}")
                         LineService.reply_flex(
                             line_bot_api,
                             event.reply_token,
@@ -1392,29 +1434,13 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
         else:
             # 以下單時間由舊到新排列，讓序號穩定
             orders.sort(key=lambda o: (o.get('orderDate') is None, o.get('orderDate')))
-            total_debt = sum(o.get('totalAmount', 0) for o in orders)
-            lines = [f"📋 您目前共有 {len(orders)} 筆未付款訂單（合計 ${total_debt}）：\n"]
-            tw_tz = timezone(timedelta(hours=8))
-            for idx, o in enumerate(orders, start=1):
-                items_list = o.get('items', [])
-                items_str = "、".join([
-                    f"{i.get('productName', '')} x{i.get('quantity', 0)}"
-                    for i in items_list
-                ])
-                total = o.get('totalAmount', 0)
-                status = o.get('paymentStatus', '')
-                status_str = "（已回報，待確認）" if status == 'pending_confirmation' else ""
-                order_date = o.get('orderDate')
-                if order_date is not None:
-                    try:
-                        date_str = order_date.astimezone(tw_tz).strftime('%Y/%m/%d %H:%M')
-                    except Exception:
-                        date_str = str(order_date)
-                else:
-                    date_str = "—"
-                lines.append(f"#{idx}  {date_str}\n  {items_str}｜${total}{status_str}")
-            lines.append("\n💡 輸入序號即可回報付款，例：1")
-            reply_text = "\n".join(lines)
+            LineService.reply_flex(
+                line_bot_api,
+                event.reply_token,
+                "未付款訂單",
+                _flex_customer_unpaid_orders(orders),
+            )
+            return
 
     # ── 回報付款 <序號> ──────────────────────────────────────────────
     elif user_msg.startswith("回報付款"):
@@ -1425,7 +1451,11 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
         if not serial_str:
             _customer_next_input_mode[user_id] = "payment_serial"
             _customer_pending_data[user_id] = {}
-            reply_text = "請輸入序號，例：1"
+            try:
+                line_bot_api.unlink_rich_menu_from_user(user_id)
+            except Exception as _e:
+                logger.warning(f"Could not unlink rich menu for {user_id}: {_e}")
+            reply_text = "請輸入要回報付款的序號，例：1"
         else:
             try:
                 serial = int(serial_str)
@@ -1481,15 +1511,15 @@ def _handle_customer_message(event: MessageEvent, line_bot_api: LineBotApi, user
 
     # ── 聯絡老闆 <訊息內容> ────────────────────────────────────────────
     elif user_msg == "直接聯絡老闆" or user_msg == "聯絡老闆":
-        if not Config.BOSS_LINE_ID:
-            logger.error("BOSS_LINE_ID is not configured.")
+        if not Config.BOSS_LINE_SHORT_ID:
+            logger.error("BOSS_LINE_SHORT_ID is not configured.")
             reply_text = "目前無法連結到老闆，請稍後再試。"
         else:
             LineService.reply_flex(
                 line_bot_api,
                 event.reply_token,
                 "聯絡老闆",
-                _flex_contact_boss_card(Config.BOSS_LINE_ID),
+                _flex_contact_boss_card(Config.BOSS_LINE_SHORT_ID),
             )
             return
 
@@ -1610,10 +1640,12 @@ def _flex_spec_picker(category_name: str, variants: list):
     )
 
 
-def _flex_product_detail(global_idx: int, product: dict, boss_flow: bool = False):
+def _flex_product_detail(global_idx: int, product: dict, boss_flow: bool = False, ordering_flow: bool = False):
     """
     Step 3: Product detail card — name, spec, price, index, and order instruction.
-    boss_flow=True shows a quantity-input prompt instead of the customer order syntax.
+    boss_flow=True    : boss quantity-input prompt.
+    ordering_flow=True: customer ordering — keyboard is already shown, prompt for quantity.
+    neither           : browse-only view from "查看商品" (no ordering UI).
     """
     name = product.get('productName', '')
     spec = product.get('spec', '')
@@ -1677,14 +1709,19 @@ def _flex_product_detail(global_idx: int, product: dict, boss_flow: bool = False
                     TextComponent(text='請直接輸入購買數量，例：2',
                                   size='sm', color='#333333', margin='sm'),
                 ]
-                if boss_flow else
-                [
-                    TextComponent(text='下單方式', size='sm', weight='bold', color='#555555'),
-                    TextComponent(text=f'下單 {global_idx} 數量',
-                                  size='sm', color='#333333', margin='sm'),
-                    TextComponent(text=f'例: 下單 {global_idx} 2',
-                                  size='xs', color='#AAAAAA'),
-                ]
+                if boss_flow else (
+                    [
+                        TextComponent(text='請輸入購買數量', size='sm', weight='bold', color='#555555'),
+                        TextComponent(text='直接輸入數量即可，例：2',
+                                      size='sm', color='#333333', margin='sm'),
+                    ]
+                    if ordering_flow else
+                    [
+                        TextComponent(text='如需下單', size='sm', weight='bold', color='#555555'),
+                        TextComponent(text='請點選「我要下單」瀏覽商品並下單',
+                                      size='sm', color='#888888', margin='sm', wrap=True),
+                    ]
+                )
             ),
         ),
     )
@@ -1714,16 +1751,99 @@ def _flex_customer_address_prompt(items_summary: str):
                     size='sm',
                     color='#444444',
                 ),
-                TextComponent(
-                    text='如需取消請輸入「取消下單」',
-                    wrap=True,
-                    margin='md',
-                    size='xs',
-                    color='#888888',
+            ],
+        ),
+        footer=BoxComponent(
+            layout='vertical',
+            padding_all='md',
+            contents=[
+                ButtonComponent(
+                    style='secondary',
+                    height='sm',
+                    action=MessageAction(label='✕ 取消下單', text='取消下單'),
                 ),
             ],
         ),
     )
+
+
+def _flex_customer_unpaid_orders(orders: list):
+    """Carousel of the customer's unpaid order bubbles; each has a 回報付款 button."""
+    tw_tz = timezone(timedelta(hours=8))
+    bubbles = []
+    for idx, o in enumerate(orders[:10], start=1):
+        items_list = o.get('items', [])
+        status = o.get('paymentStatus', '')
+        if status == 'pending_confirmation':
+            status_label = '已回報，待確認'
+            status_color = '#FF9500'
+        else:
+            status_label = '未付款'
+            status_color = '#E53935'
+
+        order_date = o.get('orderDate')
+        if order_date:
+            try:
+                date_str = order_date.astimezone(tw_tz).strftime('%Y/%m/%d')
+            except Exception:
+                date_str = str(order_date)
+        else:
+            date_str = '—'
+
+        body_contents = []
+        for item in items_list:
+            body_contents.append(BoxComponent(
+                layout='horizontal',
+                margin='xs',
+                contents=[
+                    TextComponent(text=item.get('productName', ''), size='sm',
+                                  color='#333333', flex=5, wrap=True),
+                    TextComponent(text=f"x{item.get('quantity', 0)}", size='sm',
+                                  color='#888888', flex=1, align='end'),
+                ],
+            ))
+        body_contents += [
+            SeparatorComponent(margin='md', color='#EEEEEE'),
+            BoxComponent(
+                layout='horizontal', margin='md',
+                contents=[
+                    TextComponent(text='總金額', size='sm', color='#888888', flex=2),
+                    TextComponent(text=f"${o.get('totalAmount', 0):,}", size='sm',
+                                  color='#222222', weight='bold', flex=3, align='end'),
+                ],
+            ),
+            BoxComponent(
+                layout='horizontal', margin='sm',
+                contents=[
+                    TextComponent(text='狀態', size='sm', color='#888888', flex=2),
+                    TextComponent(text=status_label, size='sm',
+                                  color=status_color, weight='bold', flex=3, align='end'),
+                ],
+            ),
+        ]
+
+        bubbles.append(BubbleContainer(
+            size='kilo',
+            header=BoxComponent(
+                layout='vertical',
+                background_color='#2C7A4B',
+                padding_all='md',
+                contents=[
+                    TextComponent(text=f'#{idx}', color='#CCFFCC', size='xs'),
+                    TextComponent(text=date_str, color='#FFFFFF', weight='bold', size='md'),
+                ],
+            ),
+            body=BoxComponent(
+                layout='vertical',
+                padding_all='lg',
+                spacing='none',
+                contents=body_contents,
+            ),
+        ))
+
+    if len(bubbles) == 1:
+        return bubbles[0]
+    return CarouselContainer(contents=bubbles)
 
 
 def _flex_customer_not_found(keyword: str):
@@ -2081,8 +2201,8 @@ def _flex_boss_order_success(order_id: str, customer_name: str, items_str: str, 
 
 
 def _flex_contact_boss_card(boss_id: str):
-    # LINE deep-link that opens the direct chat window for the configured boss account.
-    line_url = f"https://line.me/R/ti/p/{boss_id}"
+    # LINE deep-link for personal accounts requires the ~ prefix before the LINE ID.
+    line_url = f"https://line.me/R/ti/p/~{boss_id}"
     return BubbleContainer(
         size='giga',
         header=BoxComponent(
